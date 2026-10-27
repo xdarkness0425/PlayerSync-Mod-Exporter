@@ -1,0 +1,32 @@
+name: .NET 10 catalog and core tests
+
+on:
+  push:
+    branches:
+      - feature/fingerprint-evidence-detail
+  pull_request:
+    paths:
+      - 'src/PlayerSyncModExporter.Core/**'
+      - 'tests/PlayerSyncModExporter.Tests/**'
+      - '.github/workflows/core-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    name: Build and test standalone core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build core without warnings
+        run: dotnet build src/PlayerSyncModExporter.Core/PlayerSyncModExporter.Core.csproj --configuration Release --warnaserror
+      - name: Run core tests
+        run: dotnet test tests/PlayerSyncModExporter.Tests/PlayerSyncModExporter.Tests.csproj --configuration Release --verbosity normal --warnaserror

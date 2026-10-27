@@ -47,6 +47,13 @@ public sealed class MainWindow : Window
         SizeConstraints = new WindowSizeConstraints { MinimumSize = new Vector2(820, 520), MaximumSize = new Vector2(4000, 4000) };
     }
 
+    /// <summary>Closing the window cancels a running download of originals and deletes what it staged.</summary>
+    public override void OnClose()
+    {
+        if (_session.Phase == SessionPhase.DownloadingOriginals)
+            _session.Cancel();
+    }
+
     public override void Draw()
     {
         _session.Tick();
@@ -133,7 +140,7 @@ public sealed class MainWindow : Window
         }
 
         ImGui.Text($"Selected: {selected.PlayerName}");
-        var busy = _session.Phase is SessionPhase.Analyzing or SessionPhase.Exporting;
+        var busy = _session.Phase is SessionPhase.Analyzing or SessionPhase.Exporting or SessionPhase.DownloadingOriginals;
         ImGui.BeginDisabled(busy || selected.IsPaused || !selected.HasData);
         if (ImGui.Button(_session.Analysis == null ? "Capture and analyze" : "Recapture and analyze", Vector2.Zero))
             _session.CaptureAndAnalyze();
@@ -192,12 +199,46 @@ public sealed class MainWindow : Window
             ImGui.PopStyleColor();
         }
 
+        DrawTextureSource(analysis);
         if (_session.LiveCrossCheck is { } live)
             ImGui.TextDisabled(live);
         foreach (var w in analysis.Warnings.Take(3))
             ImGui.TextColored(Yellow, w);
         if (analysis.Warnings.Count > 3)
             ImGui.TextDisabled($"... {analysis.Warnings.Count - 3} more warnings in the log and manifest.");
+    }
+
+    private void DrawTextureSource(Core.Analysis.AnalysisResult analysis)
+    {
+        var character = analysis.Character;
+        ImGui.TextDisabled("PlayerSync texture setting for this pair: " + character.TextureSource.Describe());
+        if (character.SourceQualityDownload is { } last)
+            ImGui.TextDisabled(last.Describe());
+
+        if (_session.Phase == SessionPhase.DownloadingOriginals && _session.SourceQualityProgress is { } p)
+        {
+            var fraction = p.Requested == 0 ? 0 : p.Finished / (float)p.Requested;
+            ImGui.ProgressBar(fraction, new Vector2(-90, 0), $"PlayerSync: originals {p.Finished}/{p.Requested}");
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel##originals", Vector2.Zero))
+                _session.Cancel();
+            return;
+        }
+
+        if (!Core.SourceQuality.SourceQualityRequestPlan.From(analysis).IsNeeded)
+            return;
+
+        var unavailable = _session.OriginalsUnavailableReason();
+        ImGui.BeginDisabled(unavailable != null);
+        if (ImGui.Button("Download originals for this export", Vector2.Zero))
+            _session.StartOriginalsDownload();
+        ImGui.EndDisabled();
+        if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            ImGui.SetTooltip((unavailable != null ? unavailable + "\n\n" : string.Empty)
+                             + "Asks PlayerSync to download the source-quality originals of the compressed textures, through its normal\n"
+                             + "permission-checked download, into a temporary folder inside your export folder. Your PlayerSync settings,\n"
+                             + "this pair's appearance and PlayerSync's cache are not changed. Requires a PlayerSync build with the\n"
+                             + "source-quality export interface.");
     }
 
     private void DrawAssetTable(Core.Analysis.AnalysisResult analysis)
@@ -272,6 +313,7 @@ public sealed class MainWindow : Window
             {
                 AssetProvenance.PlayerSyncCache => "PlayerSync cache",
                 AssetProvenance.PenumbraModDirectory => "Your Penumbra",
+                AssetProvenance.SourceQualityDownload => "Downloaded original",
                 _ => "-",
             });
         }

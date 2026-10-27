@@ -14,7 +14,9 @@ MIT License, Copyright (c) 2017 Milosz Krajewski. https://github.com/MiloszKraje
 The MCDF file layout, the `FileCache.csv` layout, the content-hash scheme and the names of the data members read by reflection come from
 the PlayerSync client source (https://github.com/universalconquistador/MareSynchronosClient, commit b2f8ce8) and its MareAPI submodule.
 No source files were copied; the formats were re-implemented. The test `CompatibilityTests` contains small type declarations mirroring
-`MareCharaFileData`. Both projects are licensed under:
+`MareCharaFileData`. `integrations/playersync/0001-source-quality-export-ipc.patch` is a patch to the PlayerSync client: it contains
+context lines from PlayerSync's own files and new code meant to be distributed as part of PlayerSync under PlayerSync's license.
+Both projects are licensed under:
 
 ```
 MIT License

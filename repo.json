@@ -3,7 +3,7 @@
     "Author": "xdarkness0425",
     "Name": "PlayerSync Mod Exporter",
     "InternalName": "PlayerSyncModExporter",
-    "AssemblyVersion": "0.2.0.0",
+    "AssemblyVersion": "0.3.0.0",
     "Description": "Select a visible PlayerSync pair, review which of their synchronized mod files are available in your local PlayerSync cache, confirm you have permission, and export them as a Penumbra mod package (.pmp) with an integrity manifest.",
     "ApplicableVersion": "any",
     "RepoUrl": "https://github.com/xdarkness0425/PlayerSync-Mod-Exporter",
@@ -23,6 +23,6 @@
     "DownloadLinkInstall": "https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/dist/latest.zip",
     "DownloadLinkUpdate": "https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/dist/latest.zip",
     "DownloadLinkTesting": "https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/dist/latest.zip",
-    "LastUpdate": 1793067269
+    "LastUpdate": 1793070295
   }
 ]

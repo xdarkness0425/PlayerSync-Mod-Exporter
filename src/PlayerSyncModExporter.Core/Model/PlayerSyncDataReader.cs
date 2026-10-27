@@ -20,6 +20,8 @@ public static class PlayerSyncDataReader
         public IReadOnlyDictionary<string, string>? CompressionRedirects { get; init; }
         public IReadOnlySet<string>? ServerForbiddenHashes { get; init; }
         public DateTimeOffset? CapturedAtUtc { get; init; }
+        public SourceQuality.TextureSourceSetting? TextureSource { get; init; }
+        public SourceQuality.SourceQualityDownloadResult? SourceQualityDownload { get; init; }
     }
 
     /// <param name="received">The data exactly as received (<c>Pair.LastReceivedCharacterData</c>).</param>
@@ -59,6 +61,8 @@ public static class PlayerSyncDataReader
             NotSyncedFiles = notSynced,
             CompressionRedirects = options.CompressionRedirects ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
             ServerForbiddenHashes = options.ServerForbiddenHashes ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            TextureSource = options.TextureSource ?? SourceQuality.TextureSourceSetting.Unknown,
+            SourceQualityDownload = options.SourceQualityDownload,
             GlamourerData = ReadPlayerString(received, "GlamourerData", warnings),
             CustomizePlusData = ReadPlayerString(received, "CustomizePlusData", warnings),
             ManipulationData = GetProperty(received, "ManipulationData") as string ?? string.Empty,

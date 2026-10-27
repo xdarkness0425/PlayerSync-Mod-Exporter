@@ -129,6 +129,7 @@ Schema `playersync-mod-exporter/manifest`, `schemaVersion` 1, camelCase, enums a
 | `generator` | Tool name and version. |
 | `package` | `name`, `createdAtUtc`, `formats` (`pmp`, `mcdf`), file names, `origin: "reconstructed"` and an explanation. |
 | `character` | `label` (name, optionally `@World`, as chosen in the UI), `capturedAtUtc`, `source` ("PlayerSync"), `sourceVersion`. **No UID, alias, account ID, note or credential is ever written.** |
+| `textureSource` | PlayerSync's texture compression setting for the pair at capture time: `effectiveMode` and `globalMode` (`AlwaysSourceQuality`, `CompressedNewDownloads`, `AlwaysCompressed`; omitted when it could not be read), `pairOverride` (pair is on PlayerSync's Override UIDs list), `description`, and `download` (only if originals were requested from PlayerSync: `state`, `originalsRequested`, `originalsDownloaded`, `originalsAlreadyLocal`, `description`, `notRetrieved[]` with `hash`, `status`, `message`). Files PlayerSync downloaded for the export have `provenance: SourceQualityDownload`. See [SOURCE_QUALITY.md](SOURCE_QUALITY.md). |
 | `completeness.status` | `Complete` only if every file PlayerSync applies is included with its original bytes, nothing was excluded, filtered, forbidden, missing or corrupt, and meta is embedded (when a .pmp is written). Otherwise `Partial`. |
 | `completeness.reasons` | One human-readable line per shortfall, with counts. |
 | `consent` | The three confirmations given in the UI, with the time. |

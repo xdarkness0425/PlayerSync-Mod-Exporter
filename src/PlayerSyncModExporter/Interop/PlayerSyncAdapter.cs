@@ -7,6 +7,7 @@ using Dalamud.Plugin.Ipc;
 using Dalamud.Plugin.Services;
 using PlayerSyncModExporter.Core.Locating;
 using PlayerSyncModExporter.Core.Model;
+using PlayerSyncModExporter.Core.SourceQuality;
 
 namespace PlayerSyncModExporter.Interop;
 
@@ -32,6 +33,8 @@ public sealed record SyncedCharacter(string PlayerName, nint Address, bool IsPau
 /// PlayerSync.LoadMcdf(Async). Character data and the file cache index are not exposed, so this adapter reads them
 /// through reflection, the same approach Snappy uses. Everything here is read-only: no PlayerSync method that writes
 /// state is ever called, and the one method invoked (Pair.RemoveNotSyncedFiles) only receives a private copy.
+/// Originals are requested only through PlayerSync's own source-quality export IPC (<see cref="SourceQualityExportAvailable"/>),
+/// which a PlayerSync build must provide; see docs/SOURCE_QUALITY.md.
 /// All members are verified against PlayerSync 1.15.5.9 (MareSynchronosClient @ b2f8ce8); see docs/PLAYERSYNC_INTERNALS.md.
 /// </summary>
 public sealed class PlayerSyncAdapter : IDisposable
@@ -39,6 +42,8 @@ public sealed class PlayerSyncAdapter : IDisposable
     public const string InternalName = "MareSempiterne";
     public const string TestedVersion = "1.15.5.9";
     private const string HandledAddressesIpc = "PlayerSync.GetHandledAddresses";
+    private const string SourceQualityIpcPrefix = "PlayerSync.SourceQualityExport.";
+    public const int SourceQualityApiVersion = 1;
     private const BindingFlags AnyInstance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
     private readonly IDalamudPluginInterface _pi;
@@ -49,6 +54,11 @@ public sealed class PlayerSyncAdapter : IDisposable
     private object? _pairManager;
     private object? _fileCacheManager;
     private object? _transferOrchestrator;
+    private object? _performanceConfig;
+    private readonly ICallGateSubscriber<int> _sqApiVersion;
+    private readonly ICallGateSubscriber<nint, string, List<string>, string> _sqStart;
+    private readonly ICallGateSubscriber<string, string> _sqStatus;
+    private readonly ICallGateSubscriber<string, bool> _sqCancel;
     private MethodInfo? _getVisiblePairs;
     private MethodInfo? _getAllFileCachesByHash;
     private MethodInfo? _removeNotSyncedFiles;
@@ -59,6 +69,10 @@ public sealed class PlayerSyncAdapter : IDisposable
         _pi = pi;
         _log = log;
         _handledAddresses = pi.GetIpcSubscriber<List<nint>>(HandledAddressesIpc);
+        _sqApiVersion = pi.GetIpcSubscriber<int>(SourceQualityIpcPrefix + "GetApiVersion");
+        _sqStart = pi.GetIpcSubscriber<nint, string, List<string>, string>(SourceQualityIpcPrefix + "Start");
+        _sqStatus = pi.GetIpcSubscriber<string, string>(SourceQualityIpcPrefix + "GetStatus");
+        _sqCancel = pi.GetIpcSubscriber<string, bool>(SourceQualityIpcPrefix + "Cancel");
         _pi.ActivePluginsChanged += OnActivePluginsChanged;
     }
 
@@ -74,6 +88,7 @@ public sealed class PlayerSyncAdapter : IDisposable
 
     public void Reset()
     {
+        _performanceConfig = null;
         _pluginInstance = _pairManager = _fileCacheManager = _transferOrchestrator = null;
         _getVisiblePairs = _getAllFileCachesByHash = _removeNotSyncedFiles = null;
     }
@@ -139,6 +154,7 @@ public sealed class PlayerSyncAdapter : IDisposable
         _pairManager = Service("MareSynchronos.PlayerData.Pairs.PairManager");
         _fileCacheManager = Service("MareSynchronos.FileCache.FileCacheManager");
         _transferOrchestrator = Service("MareSynchronos.WebAPI.Files.FileTransferOrchestrator");
+        _performanceConfig = Service("MareSynchronos.MareConfiguration.PlayerPerformanceConfigService");
 
         _getVisiblePairs = _pairManager?.GetType().GetMethod("GetVisiblePairs", AnyInstance, Type.EmptyTypes);
         _getAllFileCachesByHash = _fileCacheManager?.GetType().GetMethod("GetAllFileCachesByHash", AnyInstance,
@@ -152,6 +168,8 @@ public sealed class PlayerSyncAdapter : IDisposable
             messages.Add("PlayerSync's permission filter was not found; files PlayerSync filters out cannot be identified.");
         if (_transferOrchestrator == null)
             messages.Add("PlayerSync's forbidden-file list is unavailable.");
+        if (_performanceConfig == null)
+            messages.Add("PlayerSync's texture compression setting could not be read.");
     }
 
     /// <summary>
@@ -218,7 +236,7 @@ public sealed class PlayerSyncAdapter : IDisposable
     /// Takes an immutable snapshot of what PlayerSync last received for this pair and what it applies after
     /// its permission filters. Must be called on the framework thread. Never modifies PlayerSync's objects.
     /// </summary>
-    public CapturedCharacter? Capture(SyncedCharacter character, string label, out string? error)
+    public CapturedCharacter? Capture(SyncedCharacter character, string label, out string? error, SourceQualityDownloadResult? download = null)
     {
         error = null;
         var pair = character.PairHandle;
@@ -263,7 +281,100 @@ public sealed class PlayerSyncAdapter : IDisposable
             SourceVersion = _status.Version,
             CompressionRedirects = ReadCompressionRedirects(pair),
             ServerForbiddenHashes = ReadForbiddenHashes(),
+            TextureSource = ReadTextureSource(pair),
+            SourceQualityDownload = download,
         });
+    }
+
+    /// <summary>
+    /// PlayerSync's texture compression mode for this pair, computed like PairHandler.ComputeCompressedAlternateUsage:
+    /// a pair whose UID or alias is in PlayerPerformanceConfig.UIDsToOverride always gets source quality, otherwise the
+    /// global TextureCompressionMode (null means PlayerSync's default). The identifiers are compared here and never stored.
+    /// </summary>
+    public TextureSourceSetting ReadTextureSource(object pair)
+    {
+        try
+        {
+            var current = _performanceConfig != null ? GetMember(_performanceConfig, "Current") : null;
+            if (current == null)
+                return TextureSourceSetting.Unknown;
+            var raw = GetMember(current, "TextureCompressionMode");
+            int? mode = raw is Enum e ? Convert.ToInt32(e, System.Globalization.CultureInfo.InvariantCulture) : null;
+            var list = GetMember(current, "UIDsToOverride") as List<string>;
+            var user = GetMember(pair, "UserData");
+            var ids = user == null ? [] : new[] { GetMember(user, "UID") as string, GetMember(user, "Alias") as string };
+            var overridden = list != null && ids.Any(id => !string.IsNullOrEmpty(id) && list.Contains(id, StringComparer.Ordinal));
+            return TextureSourceSetting.FromPlayerSync(mode, overridden);
+        }
+        catch (Exception ex) when (ex is TargetInvocationException or InvalidOperationException or InvalidCastException)
+        {
+            _log.Debug($"Reading the texture compression setting failed: {ex.Message}");
+            return TextureSourceSetting.Unknown;
+        }
+    }
+
+    /// <summary>True when the installed PlayerSync provides the source-quality export IPC this exporter understands.</summary>
+    public bool SourceQualityExportAvailable()
+    {
+        try
+        {
+            return _sqApiVersion.HasFunction && _sqApiVersion.InvokeFunc() == SourceQualityApiVersion;
+        }
+        catch (Exception e)
+        {
+            _log.Debug($"Source-quality export IPC unavailable: {e.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Asks PlayerSync to put the originals of <paramref name="hashes"/> for this pair into <paramref name="stagingDirectory"/>.
+    /// PlayerSync checks that the pair is visible and unpaused and only fetches files in its permission-filtered data.
+    /// Framework thread only. Returns the request id, or null with an error.
+    /// </summary>
+    public string? StartSourceQualityExport(SyncedCharacter character, string stagingDirectory, IReadOnlyList<string> hashes, out string? error)
+    {
+        error = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(_sqStart.InvokeFunc(character.Address, stagingDirectory, hashes.ToList()));
+            var root = doc.RootElement;
+            if (root.TryGetProperty("requestId", out var id) && id.GetString() is { Length: > 0 } requestId)
+                return requestId;
+            error = root.TryGetProperty("error", out var e) ? e.GetString() : null;
+        }
+        catch (Exception e)
+        {
+            _log.Warning(e, "Starting the source-quality export failed");
+            error = e.Message;
+        }
+
+        error ??= "PlayerSync did not accept the request.";
+        return null;
+    }
+
+    public SourceQualityDownloadResult GetSourceQualityExportStatus(string requestId)
+    {
+        try
+        {
+            return SourceQualityDownloadResult.Parse(_sqStatus.InvokeFunc(requestId));
+        }
+        catch (Exception e)
+        {
+            return new SourceQualityDownloadResult { State = "Failed", Error = "PlayerSync is not responding: " + e.Message };
+        }
+    }
+
+    public void CancelSourceQualityExport(string requestId)
+    {
+        try
+        {
+            _sqCancel.InvokeFunc(requestId);
+        }
+        catch (Exception e)
+        {
+            _log.Debug($"Cancelling the source-quality export failed: {e.Message}");
+        }
     }
 
     private Dictionary<string, string> ReadCompressionRedirects(object pair)

@@ -49,6 +49,9 @@ public enum AssetProvenance
 
     /// <summary>Found inside your own Penumbra mod directory (PlayerSync indexes those files too).</summary>
     PenumbraModDirectory,
+
+    /// <summary>Downloaded at source quality by PlayerSync for this export into the exporter's own staging folder.</summary>
+    SourceQualityDownload,
 }
 
 public enum SharingStatus

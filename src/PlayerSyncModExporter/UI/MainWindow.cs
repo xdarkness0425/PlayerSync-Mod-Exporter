@@ -247,17 +247,32 @@ public sealed class MainWindow : Window
     {
         if (!ImGui.CollapsingHeader("Mod fingerprint catalog (read-only)", ImGuiTreeNodeFlags.DefaultOpen))
             return;
+
         var catalog = ModFingerprintCatalog.From(analysis.Metadata);
-        ImGui.TextDisabled("Matching files from your installed Penumbra mods. These are candidates, not confirmed source packages.");
+        ImGui.TextDisabled("Exact local hash + game-path matches. Candidates do not prove the other player's mod or option selection.");
+        if (catalog.Count == 0)
+        {
+            ImGui.TextDisabled("No known mod fingerprints matched the currently selected pair.");
+            return;
+        }
+
         foreach (var match in catalog)
         {
-            ImGui.TextUnformatted(match.ModName + ": " + match.MatchedPaths + " matching paths"
-                + (match.AmbiguousPaths > 0 ? " (" + match.AmbiguousPaths + " shared)" : ""));
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("Folder: " + match.ModFolder + "\\nOptions: " + string.Join(", ", match.OptionNames));
+            if (!ImGui.TreeNode($"{match.ModName}##catalog-{match.ModFolder}"))
+                continue;
+
+            ImGui.Text($"Matched paths: {match.MatchedPaths} | Distinctive in your catalog: {match.DistinctivePaths} | Shared: {match.AmbiguousPaths}");
+            foreach (var option in match.OptionMatches)
+                ImGui.TextUnformatted($"{(option.IsDefault ? "Default" : option.GroupName + " / " + option.OptionName)}: "
+                    + $"{option.MatchedPaths} paths ({option.SharedPaths} shared)");
+            if (ImGui.TreeNode($"Verified resource details##catalog-files-{match.ModFolder}"))
+            {
+                foreach (var file in match.Files)
+                    ImGui.TextUnformatted($"{file.Kind}: {file.GamePath} ({file.CatalogModCount} catalog mods)");
+                ImGui.TreePop();
+            }
+            ImGui.TreePop();
         }
-        if (catalog.Count == 0)
-            ImGui.TextDisabled("No catalog matches for the selected pair.");
     }
 
     private void DrawAssetTable(Core.Analysis.AnalysisResult analysis)

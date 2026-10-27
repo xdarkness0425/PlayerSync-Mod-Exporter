@@ -60,6 +60,9 @@ public sealed class MetadataRecoveryResult
     public IReadOnlyList<string> LibraryProblems { get; init; } = [];
     public IReadOnlyList<RecoveredSourceMod> SourceMods { get; init; } = [];
 
+    /// <summary>Every exact installed-mod candidate, even if package attribution was ambiguous.</summary>
+    public IReadOnlyList<ModFingerprintEvidence> FingerprintEvidence { get; init; } = [];
+
     /// <summary>Keyed by (expected asset hash, game path).</summary>
     public IReadOnlyDictionary<(string Hash, string GamePath), PathAttribution> Paths { get; init; }
         = new Dictionary<(string, string), PathAttribution>();
@@ -100,6 +103,20 @@ public static class MetadataRecoverer
             if (found.Count > 0)
                 matches[(asset.Hash, gamePath)] = found;
         }
+
+        // Preserve all exact (hash, game path) candidates before package attribution
+        // chooses an option or refuses to choose between shared mod resources.
+        var fingerprintEvidence = matches
+            .OrderBy(m => m.Key.GamePath, StringComparer.Ordinal)
+            .ThenBy(m => m.Key.Hash, StringComparer.Ordinal)
+            .SelectMany(m => m.Value.Select(candidate => new ModFingerprintEvidence(
+                m.Key.Hash, m.Key.GamePath,
+                candidate.Mod.FolderName, candidate.Mod.DisplayName,
+                candidate.Group?.Index ?? -1, candidate.Group?.Name,
+                candidate.Group == null ? -1 : candidate.Option.Index,
+                candidate.Group == null ? null : candidate.Option.Name)))
+            .Distinct()
+            .ToList();
 
         // 2. Choose a mod per path. Unique -> Recovered; several -> the mod with strictly most matches overall (Inferred); tie -> none.
         var modScore = matches.Values.SelectMany(m => m.Select(r => r.Mod).Distinct())
@@ -177,6 +194,7 @@ public static class MetadataRecoverer
             ModsIndexed = library.Mods.Count,
             LibraryProblems = library.Problems,
             SourceMods = sourceMods,
+            FingerprintEvidence = fingerprintEvidence,
             Paths = paths,
         };
     }

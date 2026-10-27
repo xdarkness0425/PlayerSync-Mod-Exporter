@@ -73,7 +73,7 @@ Importing: see [docs/EXPORT_FORMAT.md](docs/EXPORT_FORMAT.md). In short, import 
 
 You can optionally specify a separate directory containing copied PlayerSync content-addressed files through **Additional read-only resource copy** in the export window. Recapture the selected visible pair after changing the setting. The exporter only probes filenames corresponding to the pair's permission-filtered hashes, verifies each file with SHA-1, and never writes to the resource copy. Its location is excluded as an export destination. Missing copied files do not prove the resource never existed; PlayerSync's regular cache remains the primary lookup source.
 
-After capture, expand **Mod fingerprint catalog (read-only)**. It shows mod candidates based on exact file-hash and game-path matches from your own installed Penumbra library, with counts of distinct matching paths and shared/ambiguous paths. These are *candidates*, not verified claims about which full mod packages another player installed. The catalog does not upload hashes or scan unrelated players.
+After capture, expand **Mod fingerprint catalog (read-only)**. It shows mod candidates based on exact file-hash and game-path matches from your own installed Penumbra library, with distinct matching paths, file-type breakdowns, per-option evidence and resource popularity across the local catalog. Distinctive means unique among **your indexed local mods**, not proof of which package a sender installed. These are *candidates*, not verified claims about which full mod packages another player installed. The catalog does not upload hashes or scan unrelated players.
 
 ## File locations
 

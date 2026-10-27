@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <!-- Keep the project name configurable in one place. -->
+    <ExporterProjectName>PlayerSync Mod Exporter</ExporterProjectName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>

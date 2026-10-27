@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/PlayerSyncModExporter.Core/PlayerSyncModExporter.Core.csproj" />
+    <Project Path="src/PlayerSyncModExporter/PlayerSyncModExporter.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PlayerSyncModExporter.Tests/PlayerSyncModExporter.Tests.csproj" />
+  </Folder>
+</Solution>

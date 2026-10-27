@@ -17,7 +17,7 @@ dotnet test  PlayerSyncModExporter.slnx -c Release
 | Step | Result |
 |---|---|
 | `dotnet build -c Release` (Core, plugin, tests) | Succeeded, 0 warnings, 0 errors. DalamudPackager produced `bin/Release/PlayerSyncModExporter/latest.zip` and the manifest JSON (API level 15). |
-| `dotnet test -c Release` | **65 passed, 0 failed, 0 skipped** (about 5 s). |
+| `dotnet test -c Release` | **110 passed, 0 failed, 0 skipped** (about 5 s). 65 original tests plus 45 for metadata and texture recovery. |
 
 ## What the automated tests cover
 
@@ -39,6 +39,13 @@ directory and `FileCache.csv`). The tests are in `tests/PlayerSyncModExporter.Te
 | Valid, inspectable, importable package | `CompatibilityTests.Pmp_SatisfiesPenumbraArchiveImportRules` (checks the rules Penumbra's archive importer and `SubMod` loader apply, extracts the zip and re-hashes every file), `CompatibilityTests.Mcdf_IsReadableWithPlayerSyncsReaderLogic` (reads the MCDF with the same `LZ4Stream`/`BinaryReader.ReadChars`/`ReadInt32`/JSON calls as PlayerSync's `MareCharaFileHeader.FromBinaryReader` and `McdfExtractFiles`) |
 | Permission and licensing safeguards | `ExportWithoutConsent_IsRefused`, `NotSyncedAndForbiddenFiles_AreNeverExportable_EvenIfPresentLocally`, `CompressedAlternates_AreExportedButFlagged`, `UserExclusion_IsRecordedAsPartial`, manifest `sharingStatus: Unknown` asserted in `CompleteExport...` |
 | Meta manipulations | `Version0Meta_IsEmbedded`, `BinaryMeta_WithoutPenumbra_IsPreservedButNotEmbedded`, `MetaCodecTests.*` |
+| Metadata: known-good fixture | `MetadataRecoveryTests.KnownGoodV3Mod_RecoversNamesAndReproducesTheUsedSingleOption`, `V4Mod_MultiGroup_KeepsOriginalOrderAndEnablesUsedOptions` |
+| Metadata: missing, malformed, partial | `NoInstalledCopy_FallsBackToDefaultOption_WithInferredCategoryAndUnavailableFields`, `WithoutModLibrary_NothingIsAttributed`, `PartiallyPopulatedMetadata_MarksMissingFieldsUnavailable`, `MalformedAndHostileMods_AreSkippedWithProblems`, `Limits_StopOversizedMods` |
+| Metadata: Recovered/Inferred/Unavailable labels | `IdenticalFilesInTwoMods_TieIsUnavailable_ClearWinnerIsInferred`, `SameGamePathWithDifferentContent_IsNotAttributed`, `SameContentAtDifferentGamePath_IsNotAttributed`, `GamePathCategory_DescribesTheReplacedItem` (9 cases) |
+| Metadata: ordering, defaults, file relationships, valid .pmp | `FileOnlyInAnUnusedSingleOption_StaysInDefaultOptionWithNote`, `ExportedPmpWithGroups_SatisfiesPenumbraGroupRules`, `IdenticalInputs_ProduceIdenticalPackageMetadata` |
+| Textures: header validation (valid, truncated, invalid, size limits) | `TexFileValidatorTests.*` (5 valid formats, truncated header, truncated data, huge claimed surface, 6 invalid headers, random bytes) |
+| Textures: every confirmed representation | `TextureRecoveryTests.ValidCompressedAlternate_IsPreservedByteForByte_AndVerifiedAgainstTheAlternateHash` (T4), `OriginalMissingFromPlayerSyncIndex_IsRecoveredFromInstalledModByGamePath` (T4 recovery), `CacheFilesAreAlreadyDecoded_AndAreNeverDecompressedAgain` (T2), `OriginalWithUnrecognizedHeader_IsStillExportedUnchanged` (T1) |
+| Textures: corrupt, unsupported, mixed outcomes | `InvalidOrTruncatedCompressedAlternate_IsNotExported` (2 cases), `InstalledModWithDifferentFileAtThatPath_DoesNotReplaceTheAlternate`, `MixedTextureOutcomes_AreEachReported_AndThePackageIsPartialWithReasons` |
 
 ### Additional manual check (not in the repository)
 
@@ -61,6 +68,9 @@ None of the following has been run. They are not claimed to work until someone t
 6. Applying a generated `.mcdf` to a GPose actor through PlayerSync's "From MCDF" tab.
 7. The ImGui window: layout, the folder picker, the conflict popup, progress and cancellation during a real multi-GB export.
 8. Behaviour while PlayerSync is disconnected, reloading, or downloading the selected pair's files.
+9. Indexing a real Penumbra mod directory (hundreds of mods, FileVersion 4 files with conditions, IMC and combining groups) and how long it takes.
+10. Importing a `.pmp` with recovered `group_NNN_*.json` files in the installed Penumbra and checking that the enabled options reproduce the look.
+11. Real PlayerSync compressed alternates: confirming they pass the texture header check (only synthetic BC7 fixtures were used).
 
 ### Suggested in-game test plan
 

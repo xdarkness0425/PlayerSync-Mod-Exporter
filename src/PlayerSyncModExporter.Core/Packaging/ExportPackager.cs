@@ -5,6 +5,7 @@ using PlayerSyncModExporter.Core.Analysis;
 using PlayerSyncModExporter.Core.Hashing;
 using PlayerSyncModExporter.Core.IO;
 using PlayerSyncModExporter.Core.Meta;
+using PlayerSyncModExporter.Core.Metadata;
 using PlayerSyncModExporter.Core.Model;
 using PlayerSyncModExporter.Core.Safety;
 
@@ -372,9 +373,19 @@ public sealed class ExportPackager
             Description:
             $"Reconstructed from the PlayerSync appearance of \"{c.Label}\" captured {c.CapturedAtUtc:yyyy-MM-dd HH:mm} UTC. "
             + "This is not an original mod archive; the original creators and their terms are unknown. "
-            + "See export_manifest.json for the file inventory and completeness.",
+            + "See export_manifest.json for the file inventory and completeness."
+            + SourceModsLine(request.Analysis.Metadata),
             Version: c.CapturedAtUtc.ToString("yyyy.MM.dd.HHmm"),
             Tags: ["PlayerSync Export"]);
+    }
+
+    private static string SourceModsLine(MetadataRecoveryResult metadata)
+    {
+        if (metadata.SourceMods.Count == 0)
+            return string.Empty;
+        var list = metadata.SourceMods.Select(m =>
+            m.Mod.DisplayName + (string.IsNullOrWhiteSpace(m.Mod.Author) ? "" : " by " + m.Mod.Author) + (string.IsNullOrWhiteSpace(m.Mod.Version) ? "" : " v" + m.Mod.Version));
+        return "\n\nFiles matched byte-for-byte to mods installed on the exporting computer (names as recorded there): " + string.Join("; ", list) + ".";
     }
 
     private static async Task WriteAppearanceAsync(string stagingPath, CapturedCharacter c, ExportManifest manifest, CancellationToken token)
@@ -414,9 +425,18 @@ public sealed class ExportPackager
             Included = archiveByAsset.ContainsKey(a),
             Provenance = a.Provenance.ToString(),
             IsOriginalContent = a.Status == AssetStatus.Available && a.IsOriginalContent,
+            Representation = a.ContentHash == null ? null : a.Representation.ToString(),
+            VerifiedAgainst = a.ContentHash == null ? null
+                : a.Representation == ContentRepresentation.CompressedAlternate ? "compressedAlternateHash" : "hash",
+            Texture = a.Texture == null ? null : new ManifestTexture
+            {
+                HeaderValid = a.Texture.Valid, Format = a.Texture.Format, Width = a.Texture.Width, Height = a.Texture.Height,
+                MipLevels = a.Texture.MipLevels, ArraySize = a.Texture.ArraySize, Problem = a.Texture.Problem,
+            },
             SharingStatus = a.Sharing.ToString(),
             ArchivePath = archiveByAsset.GetValueOrDefault(a),
             Note = a.Note,
+            Attribution = BuildAttribution(a, analysis.Metadata, plan),
         }).ToList();
 
         var includedAssets = analysis.Assets.Where(archiveByAsset.ContainsKey).ToList();
@@ -434,6 +454,8 @@ public sealed class ExportPackager
             InvalidMetadata = analysis.Count(AssetStatus.InvalidMetadata),
             ExcludedByUser = analysis.Assets.Count(a => a.IsExportable && !archiveByAsset.ContainsKey(a)),
             CompressedAlternatesIncluded = includedAssets.Count(a => !a.IsOriginalContent),
+            InvalidContent = analysis.Count(AssetStatus.InvalidContent),
+            OriginalsFromInstalledMods = includedAssets.Count(a => a.Representation == ContentRepresentation.OriginalFromInstalledMod),
             FileSwaps = plan.FileSwaps.Count,
         };
 
@@ -451,7 +473,9 @@ public sealed class ExportPackager
         Reason(summary.NotSynced, "file(s) were not synced to you by PlayerSync (permissions/filters).");
         Reason(summary.ForbiddenByServer, "file(s) are forbidden by the PlayerSync server.");
         Reason(summary.ExcludedByUser, "available file(s) were excluded by your selection.");
-        Reason(summary.CompressedAlternatesIncluded, "texture(s) are PlayerSync compressed alternates, not the original files.");
+        Reason(summary.InvalidContent, "compressed substitute(s) are not valid textures and were not exported.");
+        Reason(summary.CompressedAlternatesIncluded,
+            "texture(s) are PlayerSync's re-encoded compressed substitutes, not the original files; the originals are not on this computer and cannot be reconstructed from them.");
         Reason(analysis.FileSwaps.Count - plan.FileSwaps.Count, "file swap(s) were left out.");
         if (meta.Manifest.Present && !meta.Manifest.EmbeddedInPmp && request.WritePmp)
             reasons.Add("Meta manipulations are not embedded in the .pmp (kept in the .mcdf and appearance folder).");
@@ -486,10 +510,122 @@ public sealed class ExportPackager
             {
                 GamePath = s.GamePath, Target = s.Target, ObjectKind = s.Kind.ToString(), Included = plan.FileSwaps.Contains(s),
             }).ToList(),
+            Metadata = BuildMetadataRecovery(analysis, plan),
             Meta = meta.Manifest,
             Warnings = [.. analysis.Warnings, .. plan.Warnings],
         };
+        if (plan.Groups.Count > 0)
+            manifest.Package.OriginNote =
+                "This package was reconstructed from content-addressed files in a local PlayerSync cache. It is not an original mod archive. "
+                + $"{plan.Groups.Count} option group(s) reproduce groups of mods installed on this computer that contain byte-identical files; "
+                + "see metadata.sourceMods. Options the character does not use are not included.";
         return manifest;
+    }
+
+    private static List<ManifestAttribution> BuildAttribution(AssetEntry asset, MetadataRecoveryResult metadata, PackagePlan plan)
+    {
+        var result = new List<ManifestAttribution>();
+        foreach (var gamePath in asset.GamePaths.Select(p => p.GamePath).Distinct(StringComparer.Ordinal))
+        {
+            var a = metadata.Find(asset.Hash, gamePath);
+            var inGroup = plan.Groups.FirstOrDefault(g => g.Options.Any(o => o.Files.ContainsKey(gamePath)) && g.Source == a?.Group);
+            result.Add(new ManifestAttribution
+            {
+                GamePath = gamePath,
+                Classification = (a?.Classification ?? MetadataClassification.Unavailable).ToString(),
+                ModName = a?.Mod?.DisplayName,
+                ModFolder = a?.Mod?.FolderName,
+                Group = a?.Group?.Name,
+                Options = a?.Options.Select(o => o.Name).ToList() ?? [],
+                Placement = a?.Mod == null ? "unattributed" : inGroup != null ? "group" : "default",
+                CandidateMods = a?.CandidateMods.ToList() ?? [],
+                InferredCategory = new ClassifiedField
+                {
+                    Value = GamePathCategory.Describe(gamePath), Classification = nameof(MetadataClassification.Inferred), Source = "game path layout",
+                },
+                Note = a != null ? a.Note : (metadata.LibraryAvailable
+                    ? "No installed mod contains a byte-identical file for this game path."
+                    : "Your Penumbra mod directory was not available, so no source mod could be looked up."),
+            });
+        }
+
+        return result;
+    }
+
+    private static ManifestMetadataRecovery BuildMetadataRecovery(AnalysisResult analysis, PackagePlan plan)
+    {
+        const string local = "installed mod (local Penumbra mod directory)";
+        static ClassifiedField Field(string? value, string source)
+            => string.IsNullOrWhiteSpace(value)
+                ? new ClassifiedField { Classification = nameof(MetadataClassification.Unavailable), Source = "not set in " + source }
+                : new ClassifiedField { Value = value, Classification = nameof(MetadataClassification.Recovered), Source = source };
+
+        var metadata = analysis.Metadata;
+        var exported = plan.Redirections.Keys.ToHashSet(StringComparer.Ordinal);
+        var attributions = analysis.Assets.Where(a => a.Status == AssetStatus.Available)
+            .SelectMany(a => a.GamePaths.Select(p => p.GamePath).Distinct(StringComparer.Ordinal).Where(exported.Contains)
+                .Select(gp => metadata.Find(a.Hash, gp)))
+            .ToList();
+
+        var result = new ManifestMetadataRecovery
+        {
+            LibraryAvailable = metadata.LibraryAvailable,
+            ModsIndexed = metadata.ModsIndexed,
+            LibraryProblems = metadata.LibraryProblems.Count,
+            AttributedPaths = attributions.Count(a => a?.Mod != null),
+            AmbiguousPaths = attributions.Count(a => a is { Mod: null }),
+            UnattributedPaths = attributions.Count(a => a?.Mod == null),
+        };
+
+        foreach (var source in metadata.SourceMods)
+        {
+            var mod = source.Mod;
+            result.SourceMods.Add(new ManifestSourceMod
+            {
+                Name = Field(mod.Name, local),
+                Author = Field(mod.Author, local),
+                Description = Field(mod.Description, local),
+                Version = Field(mod.Version, local),
+                Website = Field(mod.Website, local),
+                Folder = mod.FolderName,
+                FileVersion = mod.FileVersion,
+                MatchedPaths = source.MatchedPaths,
+                Groups = source.Groups.Select(g =>
+                {
+                    var planned = plan.Groups.FirstOrDefault(p => p.Source == g.Group);
+                    var defaults = g.Group.Type == LocalGroupType.Multi
+                        ? g.Group.Options.Where(o => o.Index < 64 && (g.Group.DefaultSettings & (1UL << o.Index)) != 0).Select(o => o.Name)
+                        : g.Group.Options.Where(o => (ulong)o.Index == g.Group.DefaultSettings).Select(o => o.Name);
+                    return new ManifestSourceGroup
+                    {
+                        Name = Field(g.Group.Name, local),
+                        Type = Field(g.Group.TypeName, local),
+                        AuthorDefault = new ClassifiedField
+                        {
+                            Value = string.Join(", ", defaults), Classification = nameof(MetadataClassification.Recovered),
+                            Source = local + " DefaultSettings",
+                        },
+                        InferredSelection = new ClassifiedField
+                        {
+                            Value = string.Join(", ", g.UsedOptions.Select(o => o.Name)), Classification = nameof(MetadataClassification.Inferred),
+                            Source = "options whose files match this character's files",
+                        },
+                        ReproducedOptions = planned?.Options.Select(o => o.Source.Name).ToList() ?? [],
+                        TotalOptions = g.Group.Options.Count,
+                        PackageGroup = planned?.Name,
+                    };
+                }).ToList(),
+            });
+        }
+
+        result.Unavailable.Add("Original mod archives, images, option images and file layout: PlayerSync transfers individual files by hash only.");
+        if (result.UnattributedPaths > 0)
+            result.Unavailable.Add($"{result.UnattributedPaths} exported game path(s) have no identical file in any installed mod, so their mod name, author, "
+                                   + "version and option are unknown. Their inferredCategory only names the game item they replace.");
+        result.Unavailable.Add("Options the character does not use: their files were never sent by PlayerSync.");
+        if (!metadata.LibraryAvailable)
+            result.Unavailable.Add("Your Penumbra mod directory could not be read, so no installed mods were checked.");
+        return result;
     }
 
     /// <summary>Re-opens the written archive and checks structure and every payload hash.</summary>
@@ -522,6 +658,25 @@ public sealed class ExportPackager
                 throw new InvalidDataException($"default_mod.json maps '{gamePath}' to a file that is not in the archive.");
         }
 
+        var groupRedirections = 0;
+        for (var i = 0; i < plan.Groups.Count; i++)
+        {
+            var name = PmpWriter.GroupEntryName(i, plan.Groups[i].Name);
+            var groupEntry = zip.GetEntry(name) ?? throw new InvalidDataException($"{name} is missing.");
+            await using var s = groupEntry.Open();
+            var node = await JsonNode.ParseAsync(s, cancellationToken: token).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(node?["Name"]?.GetValue<string>()) || node["Options"] is not JsonArray options || options.Count == 0)
+                throw new InvalidDataException($"{name} has no name or no options.");
+            foreach (var option in options)
+            foreach (var (gamePath, value) in option?["Files"] as JsonObject ?? [])
+            {
+                var rel = value?.GetValue<string>()?.Replace('\\', '/');
+                if (rel == null || zip.GetEntry(rel) == null)
+                    throw new InvalidDataException($"{name} maps '{gamePath}' to a file that is not in the archive.");
+                groupRedirections++;
+            }
+        }
+
         foreach (var file in plan.Files)
         {
             var entry = zip.GetEntry(file.ArchivePath) ?? throw new InvalidDataException($"{file.ArchivePath} is missing from the archive.");
@@ -536,7 +691,8 @@ public sealed class ExportPackager
         if (zip.Entries.Any(e => e.FullName.Contains("..", StringComparison.Ordinal) || e.FullName.StartsWith('/')))
             throw new InvalidDataException("The archive contains an unsafe entry name.");
 
-        notes.Add($"PMP verified: {plan.Files.Count} payloads, {filesNode.Count} redirections, {plan.FileSwaps.Count} file swaps.");
+        notes.Add($"PMP verified: {plan.Files.Count} payloads, {filesNode.Count} default redirections, {plan.Groups.Count} option groups "
+                  + $"({groupRedirections} redirections), {plan.FileSwaps.Count} file swaps.");
         return notes;
     }
 

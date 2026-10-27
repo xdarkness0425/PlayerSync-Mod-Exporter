@@ -41,6 +41,32 @@ public sealed class TestFixture : IDisposable
         return bytes;
     }
 
+    /// <summary>A structurally valid FFXIV .tex (80-byte header, every mip level present) with random pixel data.</summary>
+    public static byte[] Tex(int width, int height, uint format = 0x6432, int mips = 1, int seed = 1, int truncateBy = 0)
+    {
+        var offsets = new List<uint>();
+        long position = Core.Textures.TexFileValidator.HeaderSize;
+        for (var i = 0; i < mips; i++)
+        {
+            offsets.Add((uint)position);
+            position += Core.Textures.TexFileValidator.SurfaceBytes(format, Math.Max(1, width >> i), Math.Max(1, height >> i));
+        }
+
+        var bytes = RandomBytes((int)position, seed);
+        var header = bytes.AsSpan(0, Core.Textures.TexFileValidator.HeaderSize);
+        header.Clear();
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(header, 0x00800000); // TextureType2D
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(header[4..], format);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(header[8..], (ushort)width);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(header[10..], (ushort)height);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(header[12..], 1);
+        header[14] = (byte)mips;
+        header[15] = 1;
+        for (var i = 0; i < offsets.Count; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(header[(28 + 4 * i)..], offsets[i]);
+        return bytes[..^truncateBy];
+    }
+
     public static string Sha1(byte[] data) => Convert.ToHexString(SHA1.HashData(data));
 
     /// <summary>Writes content into the cache the way PlayerSync's FileDownloadManager does and returns its hash.</summary>

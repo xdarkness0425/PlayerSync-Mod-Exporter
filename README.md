@@ -7,7 +7,7 @@ its hash and whether the package is complete.
 It is meant for backups and for sharing looks **with permission**: the owner of the character must agree, and the mods remain the work
 of their creators.
 
-> **Status:** builds and passes 65 automated tests. It has **not yet been tested in a live game session**. See [docs/TESTING.md](docs/TESTING.md).
+> **Status:** builds and passes 110 automated tests. It has **not yet been tested in a live game session**. See [docs/TESTING.md](docs/TESTING.md).
 
 ## What it does and does not do
 
@@ -20,8 +20,12 @@ of their creators.
   silently dropped; the package is then marked **Partial** with the reasons.
 * Tells you when a texture is only available as PlayerSync's automatically compressed version (not the creator's original).
 * Only reads PlayerSync's cache and Penumbra. It does not change collections, mods, your appearance, or PlayerSync's index.
-* Produces a **reconstructed** mod: one option with every file the character uses. The original mod archives, option groups, authors
-  and descriptions are not transferred by PlayerSync and cannot be recovered.
+* Produces a **reconstructed** mod. PlayerSync transfers no mod names or options, so where you have the same mods installed, the
+  exporter matches files byte-for-byte to them and reproduces their option groups (only the options the character uses) with
+  their original names. Everything else goes in the default option. Each recovered or inferred value is labeled in the
+  manifest; see [docs/RECOVERY.md](docs/RECOVERY.md).
+* Uses the original texture instead of PlayerSync's compressed substitute whenever the original is anywhere on your computer,
+  including your installed mods. A substitute is only exported if it is a valid texture, and it is flagged.
 
 ## Requirements
 
@@ -69,7 +73,7 @@ Importing: see [docs/EXPORT_FORMAT.md](docs/EXPORT_FORMAT.md). In short, import 
 | Exports | The folder you choose: `<folder>/<package name>/` |
 | Temporary staging | `<folder>/.psme-staging-<id>/` (removed automatically) |
 | Plugin settings | `pluginConfigs/PlayerSyncModExporter.json` |
-| Read (never written) | PlayerSync cache folder, `pluginConfigs/MareSempiterne/FileCache.csv`, the `CacheFolder` value in `pluginConfigs/MareSempiterne/config.json` (only if PlayerSync's live index is unavailable), Penumbra's mod folder |
+| Read (never written) | PlayerSync cache folder, your Penumbra mods' `meta.json`/`default_mod.json`/`group_*.json` (for names and options), `pluginConfigs/MareSempiterne/FileCache.csv`, the `CacheFolder` value in `pluginConfigs/MareSempiterne/config.json` (only if PlayerSync's live index is unavailable), Penumbra's mod folder |
 | Never read | PlayerSync's `server.json` (secret keys) or any other credentials |
 
 ## Errors and what to do
@@ -101,6 +105,7 @@ The **Log** section and Dalamud's log (`/xllog`) contain details.
 
 * [docs/PLAYERSYNC_INTERNALS.md](docs/PLAYERSYNC_INTERNALS.md): how PlayerSync syncs, stores and verifies files, from its source code, and the design that follows from it.
 * [docs/EXPORT_FORMAT.md](docs/EXPORT_FORMAT.md): package layout, manifest schema, generation steps.
+* [docs/RECOVERY.md](docs/RECOVERY.md): what mod metadata and texture data can be recovered, with evidence and limits.
 * [docs/TESTING.md](docs/TESTING.md): build and test results, coverage, and what still needs in-game testing.
 
 ## Project layout

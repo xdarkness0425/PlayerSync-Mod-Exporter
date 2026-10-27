@@ -117,7 +117,7 @@ public class AnalyzerTests : IDisposable
     public async Task CompressedAlternate_IsUsedButMarkedNotOriginal()
     {
         var original = TestFixture.Sha1(TestFixture.RandomBytes(4000, 8));
-        var alt = _fx.AddCacheFile(TestFixture.RandomBytes(1000, 9), "tex");
+        var alt = _fx.AddCacheFile(TestFixture.Tex(64, 64, seed: 9), "tex");
         var c = TestFixture.Character([new(Player, original, ["chara/a/b.tex"])], b => b.Redirects[original] = alt);
 
         var result = await _fx.Analyzer().AnalyzeAsync(c);

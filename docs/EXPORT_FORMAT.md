@@ -18,8 +18,8 @@ cancelled, the staging folder is deleted. Staging folders left by a crash are re
 `.psme-staging` marker file and older than one hour).
 
 The package is a **reconstruction**. PlayerSync transfers individual content-addressed files, not mod archives (see
-`PLAYERSYNC_INTERNALS.md` §4), so no original `.pmp`/`.ttmp2`, option groups, author, images or descriptions are available.
-`manifest.json` always says `"origin": "reconstructed"`.
+`PLAYERSYNC_INTERNALS.md` §4 and `RECOVERY.md`). Original mod names and option groups are only recovered for files that match a
+mod installed on the exporting computer byte-for-byte; `manifest.json` always says `"origin": "reconstructed"`.
 
 ## 1. `.pmp` (Penumbra mod pack)
 
@@ -29,6 +29,7 @@ A zip archive in Penumbra's **FileVersion 3** layout, which every current Penumb
 meta.json
 default_mod.json
 files/<content sha1 lower>.<ext>
+group_NNN_<mod> - <group>.json  (one per recovered option group, only when files match installed mods)
 export_manifest.json            (copy of manifest.json, ignored by Penumbra)
 ```
 
@@ -67,6 +68,24 @@ export_manifest.json            (copy of manifest.json, ignored by Penumbra)
 * `Manipulations` is filled only when the received meta string can be converted exactly: format version 0 (JSON) by the built-in decoder,
   formats 1 and 2 (binary) by Penumbra's own `MetaApi.ConvertManips` in the running game. Otherwise it is `[]`, the manifest says
   `meta.embeddedInPmp: false`, and the package is marked Partial. The raw meta string is still in the `.mcdf` and in `appearance/`.
+
+Recovered option groups (`group_001_cool top - color.json`), in the FileVersion 3 shape Penumbra's `GroupDeserialization` reads:
+
+```json
+{
+  "Name": "Cool Top - Color",
+  "Description": "<original description>\n\n[Recovered from your installed copy of \"Cool Top\". 1 option(s) this character does not use are not included. ...]",
+  "Priority": 0,
+  "Type": "Single",
+  "DefaultSettings": 0,
+  "Options": [ { "Name": "Red", "Description": "<original>", "Files": { "<game path>": "files\\<sha1>.<ext>" }, "FileSwaps": {}, "Manipulations": [] } ]
+}
+```
+
+* Groups are ordered by mod name, then original group order; options keep their original order, names, descriptions and (Multi) priorities.
+* Single groups contain the one option the character uses (`DefaultSettings` = 0). Multi groups contain every used option, all enabled.
+* Every game path is in exactly one place (a Multi option may share a path with another option of the same group, pointing to the same file).
+* Files from a source mod's default container, unattributed files, ambiguous files and meta manipulations are in `default_mod.json`.
 
 **Import:** Penumbra → Mods → "Import Mod" (or drag the file in). Then enable the mod in the collection you want, at a priority above
 conflicting mods. Apply `appearance/glamourer.b64.txt` with Glamourer ("Import from clipboard") to get the matching gear and customization.
@@ -113,9 +132,10 @@ Schema `playersync-mod-exporter/manifest`, `schemaVersion` 1, camelCase, enums a
 | `completeness.status` | `Complete` only if every file PlayerSync applies is included with its original bytes, nothing was excluded, filtered, forbidden, missing or corrupt, and meta is embedded (when a .pmp is written). Otherwise `Partial`. |
 | `completeness.reasons` | One human-readable line per shortfall, with counts. |
 | `consent` | The three confirmations given in the UI, with the time. |
-| `summary` | Counts: captured, included, bytes, duplicates merged, missing, hash mismatch, unreadable, not synced, forbidden, invalid, excluded by user, compressed alternates included, file swaps. |
-| `files[]` | **Every** captured file, exported or not: `hash` (as referenced by PlayerSync), `contentHash` (SHA-1 of the exported bytes), `extension`, `size`, `gamePaths`, `objectKinds`, `status`, `included`, `provenance`, `isOriginalContent`, `sharingStatus`, `archivePath`, `note`. |
+| `summary` | Counts: captured, included, bytes, duplicates merged, missing, hash mismatch, unreadable, not synced, forbidden, invalid, excluded by user, compressed alternates included, invalid content, originals from installed mods, file swaps. |
+| `files[]` | **Every** captured file, exported or not: `hash` (as referenced by PlayerSync), `contentHash` (SHA-1 of the exported bytes), `extension`, `size`, `gamePaths`, `objectKinds`, `status`, `included`, `provenance`, `isOriginalContent`, `representation` (`Original`, `OriginalFromInstalledMod`, `CompressedAlternate`), `verifiedAgainst` (`hash` or `compressedAlternateHash`), `texture` (header check: `headerValid`, `format`, `width`, `height`, `mipLevels`, `arraySize`, `problem`), `sharingStatus`, `archivePath`, `note`, `attribution[]` (per game path: `classification`, `modName`, `modFolder`, `group`, `options`, `placement` = `group`/`default`/`unattributed`, `candidateMods`, `inferredCategory`, `note`). |
 | `fileSwaps[]` | Every swap and whether it was included. |
+| `metadata` | Mod name and option recovery: `libraryAvailable`, `modsIndexed`, `attributedPaths`, `ambiguousPaths`, `unattributedPaths`, `sourceMods[]` (name, author, description, version, website as `{value, classification, source}`, folder, `groups[]` with `authorDefault` (Recovered), `inferredSelection` (Inferred), `reproducedOptions`, `totalOptions`, `packageGroup`) and `unavailable[]` (what cannot be recovered and why). |
 | `meta` | `present`, `formatVersion`, `embeddedInPmp`, `embeddedEntries`, `converter`, `note`. |
 | `appearance` | Relative paths of the files in `appearance/`. |
 | `warnings` | Malformed entries ignored, path conflicts and similar. |
@@ -131,6 +151,7 @@ Schema `playersync-mod-exporter/manifest`, `schemaVersion` 1, camelCase, enums a
 | `NotSynced` | PlayerSync's permissions or your filters (sounds, animations, VFX, minions, pets) kept it from you. | Never. |
 | `ForbiddenByServer` | The PlayerSync server marked it forbidden. | Never. |
 | `InvalidMetadata` | Bad hash or no valid game path in the received data. | No. |
+| `InvalidContent` | Only a compressed substitute exists and it is not a valid texture. | No. |
 
 `provenance` is `PlayerSyncCache` (downloaded by PlayerSync) or `PenumbraModDirectory` (a byte-identical file in your own Penumbra mods).
 `isOriginalContent: false` means only PlayerSync's server-compressed version of a texture was available. Its bytes differ from the
@@ -143,9 +164,10 @@ the creator's terms, and does not claim anything is safe to redistribute.
 
 1. **Capture** (framework thread): the selected pair's `LastReceivedCharacterData`, PlayerSync's own permission filter applied to a deep
    copy, compression redirects and forbidden hashes are copied into an immutable `CapturedCharacter`.
-2. **Analyze** (thread pool, up to 4 in parallel): each unique hash is located through PlayerSync's index (read-only), a direct probe of
-   the cache folder, and a read-only snapshot of `FileCache.csv`. Every candidate is SHA-1 hashed; results are cached by path, size and
-   modification time.
+2. **Analyze** (thread pool, up to 4 in parallel): the installed Penumbra mods' description files are indexed (read-only). Each unique
+   hash is located through PlayerSync's index (read-only), a direct probe of the cache folder, a read-only snapshot of `FileCache.csv`
+   and, by game path, the installed mods. Every candidate is SHA-1 hashed; results are cached by path, size and modification time.
+   `.tex` headers are checked. Files are then attributed to installed mods (see `RECOVERY.md`).
 3. **Review:** the user picks files. Only `Available` entries can be ticked. Player files are preselected; other objects only when enabled.
 4. **Plan:** `PackagePlan` deduplicates by content hash, resolves path conflicts and computes the exact size. The free disk space is
    checked against the size plus 5% and 16 MiB.

@@ -52,6 +52,9 @@ public enum AssetProvenance
 
     /// <summary>Downloaded at source quality by PlayerSync for this export into the exporter's own staging folder.</summary>
     SourceQualityDownload,
+
+    /// <summary>Verified file from a user-chosen read-only copy of PlayerSync resources.</summary>
+    AdditionalResourceDirectory,
 }
 
 public enum SharingStatus

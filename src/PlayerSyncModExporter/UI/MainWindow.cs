@@ -5,6 +5,7 @@ using Dalamud.Interface.ImGuiFileDialog;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using PlayerSyncModExporter.Core.Model;
+using PlayerSyncModExporter.Core.Metadata;
 using PlayerSyncModExporter.Core.Packaging;
 using PlayerSyncModExporter.Core.Safety;
 using PlayerSyncModExporter.Interop;
@@ -173,6 +174,7 @@ public sealed class MainWindow : Window
         if (_session.Analysis is { } analysis)
         {
             DrawSummary(analysis);
+            DrawModCatalog(analysis);
             DrawAssetTable(analysis);
             DrawExportPanel(analysis);
         }
@@ -239,6 +241,23 @@ public sealed class MainWindow : Window
                              + "permission-checked download, into a temporary folder inside your export folder. Your PlayerSync settings,\n"
                              + "this pair's appearance and PlayerSync's cache are not changed. Requires a PlayerSync build with the\n"
                              + "source-quality export interface.");
+    }
+
+    private static void DrawModCatalog(Core.Analysis.AnalysisResult analysis)
+    {
+        if (!ImGui.CollapsingHeader("Mod fingerprint catalog (read-only)", ImGuiTreeNodeFlags.DefaultOpen))
+            return;
+        var catalog = ModFingerprintCatalog.From(analysis.Metadata);
+        ImGui.TextDisabled("Matching files from your installed Penumbra mods. These are candidates, not confirmed source packages.");
+        foreach (var match in catalog)
+        {
+            ImGui.TextUnformatted(match.ModName + ": " + match.MatchedPaths + " matching paths"
+                + (match.AmbiguousPaths > 0 ? " (" + match.AmbiguousPaths + " shared)" : ""));
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip("Folder: " + match.ModFolder + "\\nOptions: " + string.Join(", ", match.OptionNames));
+        }
+        if (catalog.Count == 0)
+            ImGui.TextDisabled("No catalog matches for the selected pair.");
     }
 
     private void DrawAssetTable(Core.Analysis.AnalysisResult analysis)
@@ -314,6 +333,7 @@ public sealed class MainWindow : Window
                 AssetProvenance.PlayerSyncCache => "PlayerSync cache",
                 AssetProvenance.PenumbraModDirectory => "Your Penumbra",
                 AssetProvenance.SourceQualityDownload => "Downloaded original",
+                AssetProvenance.AdditionalResourceDirectory => "Resource copy",
                 _ => "-",
             });
         }
@@ -349,6 +369,24 @@ public sealed class MainWindow : Window
             _config.IncludeNonPlayerObjects = nonPlayer;
             _saveConfig();
         }
+
+        ImGui.TextDisabled("Optional read-only resource copy (recapture to apply)");
+        var resourceDir = _config.AdditionalResourceDirectory;
+        ImGui.SetNextItemWidth(-120);
+        if (ImGui.InputText("##resource-copy", ref resourceDir, 512, ImGuiInputTextFlags.None,
+                (ImGui.ImGuiInputTextCallbackDelegate?)null))
+        {
+            _config.AdditionalResourceDirectory = resourceDir;
+            _saveConfig();
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Browse copy", Vector2.Zero))
+            _fileDialog.OpenFolderDialog("Choose read-only resource folder", (ok, path) =>
+            {
+                if (!ok) return;
+                _config.AdditionalResourceDirectory = path;
+                _saveConfig();
+            }, string.IsNullOrEmpty(resourceDir) ? null : resourceDir, false);
 
         var dir = _config.ExportDirectory;
         ImGui.SetNextItemWidth(-120);

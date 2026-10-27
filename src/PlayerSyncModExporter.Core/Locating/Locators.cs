@@ -55,6 +55,29 @@ public sealed class CacheFolderLocator : IAssetLocator
     }
 }
 
+/// <summary>
+/// Reads only requested content-addressed filenames from a user-chosen resource copy.
+/// Does not enumerate, mutate, or import the source directory.
+/// </summary>
+public sealed class ReadOnlyResourceFolderLocator : IAssetLocator
+{
+    private readonly CacheFolderLocator _inner;
+
+    public ReadOnlyResourceFolderLocator(string folder) => _inner = new CacheFolderLocator(folder);
+
+    public string Name => "Additional read-only resource folder";
+
+    public IEnumerable<LocatedCandidate> Locate(string hash, string extension)
+    {
+        if (!Hashing.ContentHash.IsValid(hash) || extension.Length is < 1 or > 12
+            || !extension.All(char.IsAsciiLetterOrDigit))
+            yield break;
+
+        foreach (var candidate in _inner.Locate(hash, extension))
+            yield return candidate with { Provenance = AssetProvenance.AdditionalResourceDirectory };
+    }
+}
+
 /// <summary>One parsed row of PlayerSync's FileCache.csv.</summary>
 public sealed record FileCacheRecord(string Hash, string PrefixedPath, string LastModifiedTicks, long Size, long CompressedSize);
 

@@ -164,6 +164,9 @@ public sealed class ExportSession : IDisposable
         var objectIndex = FindObjectIndex(Selected.Address);
         var live = objectIndex is { } idx ? _penumbra.GetResolvedFilesFor(idx) : null;
         var locators = _playerSync.CreateLocators(_penumbra.GetModDirectory());
+        if (!string.IsNullOrWhiteSpace(_config.AdditionalResourceDirectory)
+            && Directory.Exists(_config.AdditionalResourceDirectory))
+            locators.Add(new ReadOnlyResourceFolderLocator(_config.AdditionalResourceDirectory));
         if (_originals != null && _originalsResult != null)
             locators.Insert(0, new StagedOriginalsLocator(_originals.Path, _originalsResult));
         Log($"Captured '{label}': {captured.Files.Count} file entries, {captured.FileSwaps.Count} swaps, {captured.NotSyncedFiles.Count} not synced. Sources: {string.Join(", ", locators.Select(l => l.Name))}.");
@@ -339,7 +342,7 @@ public sealed class ExportSession : IDisposable
         var dest = _config.ExportDirectory;
         if (string.IsNullOrWhiteSpace(dest) || !Path.IsPathRooted(dest))
             return "Choose an export folder.";
-        foreach (var protectedRoot in new[] { _playerSync.GetCacheFolder(), _penumbra.GetModDirectory() })
+        foreach (var protectedRoot in new[] { _playerSync.GetCacheFolder(), _penumbra.GetModDirectory(), _config.AdditionalResourceDirectory })
         {
             if (string.IsNullOrWhiteSpace(protectedRoot))
                 continue;

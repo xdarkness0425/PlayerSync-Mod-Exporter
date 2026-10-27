@@ -52,45 +52,47 @@ public sealed class ResourceCatalogTests : IDisposable
     }
 
     [Fact]
-    public void Catalog_PreservesCandidateAmbiguityAndCountsDistinctPaths()
+    public void Catalog_PreservesEveryCandidateAndPerOptionEvidence()
     {
-        var mod = new LocalMod
+        var evidence = new[]
         {
-            Directory = "/local/one", FolderName = "one", Name = "Example", Default = new LocalModOption(
-                -1, "Default", "", 0, new Dictionary<string, string>()), Groups = []
+            new ModFingerprintEvidence("H1", "chara/a/x.mdl", "one", "Example", 0, "Color", 0, "Red"),
+            new ModFingerprintEvidence("H1", "chara/a/x.mdl", "one", "Example", 0, "Color", 1, "Blue"),
+            new ModFingerprintEvidence("H1", "chara/a/x.mdl", "two", "Other", -1, null, -1, null),
+            new ModFingerprintEvidence("H2", "chara/a/y.mtrl", "one", "Example", 0, "Color", 0, "Red"),
+            new ModFingerprintEvidence("H3", "chara/a/z.tex", "one", "Example", -1, null, -1, null),
         };
-        var shared = new PathAttribution
-        {
-            GamePath = "chara/a/x.mdl",
-            Classification = MetadataClassification.Unavailable,
-            CandidateMods = ["one", "two"],
-        };
-        var unique = new PathAttribution
-        {
-            GamePath = "chara/a/y.mdl",
-            Classification = MetadataClassification.Recovered,
-            Mod = mod, CandidateMods = ["one"],
-        };
-        var recovery = new MetadataRecoveryResult
-        {
-            LibraryAvailable = true,
-            SourceMods = [new RecoveredSourceMod { Mod = mod, MatchedPaths = 1, Groups = [] }],
-            Paths = new Dictionary<(string, string), PathAttribution>
-            {
-                [("HASH1", shared.GamePath)] = shared,
-                [("HASH2", shared.GamePath)] = shared,
-                [("HASH3", unique.GamePath)] = unique,
-            }
-        };
+        var recovery = new MetadataRecoveryResult { LibraryAvailable = true, FingerprintEvidence = evidence };
         var catalog = ModFingerprintCatalog.From(recovery);
         var one = Assert.Single(catalog, c => c.ModFolder == "one");
         Assert.Equal("Example", one.ModName);
-        Assert.Equal(2, one.MatchedPaths);
+        Assert.Equal(3, one.MatchedPaths);
+        Assert.Equal(2, one.DistinctivePaths);
         Assert.Equal(1, one.AmbiguousPaths);
+        Assert.Equal(3, one.OptionMatches.Count);
+        var red = Assert.Single(one.OptionMatches, o => o.OptionName == "Red");
+        Assert.Equal(2, red.MatchedPaths);
+        Assert.Equal(1, red.SharedPaths);
+        var blue = Assert.Single(one.OptionMatches, o => o.OptionName == "Blue");
+        Assert.Equal(1, blue.MatchedPaths);
+        Assert.Equal(1, blue.SharedPaths);
         var two = Assert.Single(catalog, c => c.ModFolder == "two");
         Assert.Equal(1, two.MatchedPaths);
+        Assert.Equal(0, two.DistinctivePaths);
         Assert.Equal(1, two.AmbiguousPaths);
+        Assert.Equal(2, one.Files.Single(f => f.GamePath == "chara/a/x.mdl").CatalogModCount);
     }
+
+    [Theory]
+    [InlineData("chara/a/model.mdl", FingerprintResourceKind.Model)]
+    [InlineData("chara/a/mat.mtrl", FingerprintResourceKind.Material)]
+    [InlineData("chara/a/diffuse.tex", FingerprintResourceKind.Texture)]
+    [InlineData("chara/a/emote.pap", FingerprintResourceKind.Animation)]
+    [InlineData("chara/a/cast.avfx", FingerprintResourceKind.Effect)]
+    [InlineData("sound/a/test.scd", FingerprintResourceKind.Audio)]
+    [InlineData("chara/a/other.bin", FingerprintResourceKind.Other)]
+    public void Catalog_ClassifiesResourcesByFileType(string path, FingerprintResourceKind expected)
+        => Assert.Equal(expected, ModFingerprintCatalog.Classify(path));
 
     [Fact]
     public void Locator_InvalidHashOrExtensionNeverProbes()

@@ -1,0 +1,57 @@
+name: .NET 10 catalog and core tests
+
+on:
+  push:
+    branches:
+      - feature/fingerprint-evidence-detail
+  pull_request:
+    paths:
+      - 'src/PlayerSyncModExporter.Core/**'
+      - 'tests/PlayerSyncModExporter.Tests/**'
+      - '.github/workflows/core-tests.yml'
+      - 'src/PlayerSyncModExporter/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-tests:
+    name: Build and test standalone core
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build core without warnings
+        run: dotnet build src/PlayerSyncModExporter.Core/PlayerSyncModExporter.Core.csproj --configuration Release --warnaserror
+      - name: Run core tests
+        run: dotnet test tests/PlayerSyncModExporter.Tests/PlayerSyncModExporter.Tests.csproj --configuration Release --verbosity normal --warnaserror
+
+  plugin-build:
+    name: Build full Dalamud plugin (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install current Dalamud runtime for compilation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dalamudDir = "$env:APPDATA\XIVLauncher\addon\Hooks\dev"
+          New-Item -ItemType Directory -Force -Path $dalamudDir | Out-Null
+          Invoke-WebRequest -Uri 'https://goatcorp.github.io/dalamud-distrib/latest.zip' -OutFile 'dalamud.zip'
+          Expand-Archive -Path 'dalamud.zip' -DestinationPath $dalamudDir -Force
+          Remove-Item 'dalamud.zip'
+      - name: Build entire plugin solution (Release)
+        shell: pwsh
+        run: dotnet build PlayerSyncModExporter.slnx --configuration Release

@@ -3,6 +3,7 @@ using Dalamud.Plugin.Services;
 using PlayerSyncModExporter.Core.Analysis;
 using PlayerSyncModExporter.Core.Hashing;
 using PlayerSyncModExporter.Core.IO;
+using PlayerSyncModExporter.Core.Locating;
 using PlayerSyncModExporter.Core.Meta;
 using PlayerSyncModExporter.Core.Metadata;
 using PlayerSyncModExporter.Core.Model;

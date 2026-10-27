@@ -15,4 +15,5 @@ public sealed class Configuration : IPluginConfiguration
     public bool IncludeAppearanceData { get; set; } = true;
     public bool IncludeNonPlayerObjects { get; set; }
     public bool IncludeWorldInLabel { get; set; } = true;
+
 }

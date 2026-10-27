@@ -23,6 +23,7 @@ public sealed class ExportManifest
     public ManifestGenerator Generator { get; set; } = new();
     public ManifestPackage Package { get; set; } = new();
     public ManifestCharacter Character { get; set; } = new();
+    public ManifestTextureSource TextureSource { get; set; } = new();
     public ManifestCompleteness Completeness { get; set; } = new();
     public ManifestConsent Consent { get; set; } = new();
     public ManifestSummary Summary { get; set; } = new();
@@ -69,6 +70,38 @@ public sealed class ManifestCharacter
     public DateTimeOffset CapturedAtUtc { get; set; }
     public string Source { get; set; } = string.Empty;
     public string? SourceVersion { get; set; }
+}
+
+/// <summary>PlayerSync's texture compression setting for the pair at capture time, and any source-quality refresh.</summary>
+public sealed class ManifestTextureSource
+{
+    /// <summary>AlwaysSourceQuality, CompressedNewDownloads, AlwaysCompressed, or null when it could not be read.</summary>
+    public string? EffectiveMode { get; set; }
+    public string? GlobalMode { get; set; }
+    public bool PairOverride { get; set; }
+    public string Description { get; set; } = string.Empty;
+
+    /// <summary>Present only if originals were requested from PlayerSync for this export.</summary>
+    public ManifestSourceQualityDownload? Download { get; set; }
+}
+
+public sealed class ManifestSourceQualityDownload
+{
+    public string State { get; set; } = string.Empty;
+    public int OriginalsRequested { get; set; }
+    public int OriginalsDownloaded { get; set; }
+    public int OriginalsAlreadyLocal { get; set; }
+    public string Description { get; set; } = string.Empty;
+
+    /// <summary>Every requested original that PlayerSync could not provide, with the reason it gave.</summary>
+    public List<ManifestSourceQualityFailure> NotRetrieved { get; set; } = [];
+}
+
+public sealed class ManifestSourceQualityFailure
+{
+    public string Hash { get; set; } = string.Empty;
+    public string Status { get; set; } = string.Empty;
+    public string? Message { get; set; }
 }
 
 public sealed class ManifestCompleteness

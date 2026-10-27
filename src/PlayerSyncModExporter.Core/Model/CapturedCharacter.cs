@@ -1,3 +1,5 @@
+using PlayerSyncModExporter.Core.SourceQuality;
+
 namespace PlayerSyncModExporter.Core.Model;
 
 /// <summary>
@@ -53,6 +55,12 @@ public sealed class CapturedCharacter
 
     /// <summary>Original hash -> compressed alternate hash that PlayerSync applied instead (PairHandler.ActiveCompressionRedirects).</summary>
     public IReadOnlyDictionary<string, string> CompressionRedirects { get; init; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>PlayerSync's texture compression setting for this pair when the capture was taken.</summary>
+    public TextureSourceSetting TextureSource { get; init; } = TextureSourceSetting.Unknown;
+
+    /// <summary>Result of an export-scoped source-quality download for this capture, or null if none was run.</summary>
+    public SourceQualityDownloadResult? SourceQualityDownload { get; init; }
 
     /// <summary>Hashes the PlayerSync file server marked as forbidden (FileTransferOrchestrator.ForbiddenTransfers).</summary>
     public IReadOnlySet<string> ServerForbiddenHashes { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

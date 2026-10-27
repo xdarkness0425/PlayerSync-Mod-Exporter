@@ -229,6 +229,8 @@ public sealed class AssetAnalyzer
                 entry.Note = Append(entry.Note,
                     "Only PlayerSync's automatically compressed version of this texture is available locally. It is a different, re-encoded file, "
                     + "not the creator's original, and the original cannot be reconstructed from it.");
+                if (character.SourceQualityDownload?.Find(entry.Hash) is { IsAvailable: false } failed)
+                    entry.Note = Append(entry.Note, $"PlayerSync could not provide the original ({failed.Status}{(failed.Message is { Length: > 0 } m ? ": " + m : string.Empty)}).");
                 return;
             }
 

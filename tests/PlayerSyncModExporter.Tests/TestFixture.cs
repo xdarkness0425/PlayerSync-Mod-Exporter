@@ -121,6 +121,8 @@ public sealed class CapturedCharacterBuilder
     public HashSet<string> Forbidden { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public string Manipulations { get; set; } = string.Empty;
     public string Glamourer { get; set; } = "Bh+LCAAAAAAAAAqrVkrNS0ktUrJSUkosTgYAHwKv7xIAAAA=";
+    public Core.SourceQuality.TextureSourceSetting TextureSource { get; set; } = Core.SourceQuality.TextureSourceSetting.Unknown;
+    public Core.SourceQuality.SourceQualityDownloadResult? Download { get; set; }
 
     public CapturedCharacter Build() => new()
     {
@@ -132,6 +134,8 @@ public sealed class CapturedCharacterBuilder
         NotSyncedFiles = NotSynced,
         CompressionRedirects = Redirects,
         ServerForbiddenHashes = Forbidden,
+        TextureSource = TextureSource,
+        SourceQualityDownload = Download,
         ManipulationData = Manipulations,
         GlamourerData = Glamourer,
         CustomizePlusData = string.Empty,

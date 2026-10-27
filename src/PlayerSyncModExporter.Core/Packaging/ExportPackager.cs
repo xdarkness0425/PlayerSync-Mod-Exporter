@@ -475,7 +475,10 @@ public sealed class ExportPackager
         Reason(summary.ExcludedByUser, "available file(s) were excluded by your selection.");
         Reason(summary.InvalidContent, "compressed substitute(s) are not valid textures and were not exported.");
         Reason(summary.CompressedAlternatesIncluded,
-            "texture(s) are PlayerSync's re-encoded compressed substitutes, not the original files; the originals are not on this computer and cannot be reconstructed from them.");
+            "texture(s) are PlayerSync's re-encoded compressed substitutes, not the original files; the originals are not on this computer and cannot be reconstructed from them."
+            + (c.SourceQualityDownload != null
+                ? " PlayerSync could not provide these originals; the reasons are in textureSource.download.notRetrieved."
+                : " PlayerSync can download the originals for an export (see docs/SOURCE_QUALITY.md)."));
         Reason(analysis.FileSwaps.Count - plan.FileSwaps.Count, "file swap(s) were left out.");
         if (meta.Manifest.Present && !meta.Manifest.EmbeddedInPmp && request.WritePmp)
             reasons.Add("Meta manipulations are not embedded in the .pmp (kept in the .mcdf and appearance folder).");
@@ -492,6 +495,22 @@ public sealed class ExportPackager
             Character = new ManifestCharacter
             {
                 Label = c.Label, CapturedAtUtc = c.CapturedAtUtc, Source = c.Source, SourceVersion = c.SourceVersion,
+            },
+            TextureSource = new ManifestTextureSource
+            {
+                EffectiveMode = c.TextureSource.Effective?.ToString(),
+                GlobalMode = c.TextureSource.GlobalMode?.ToString(),
+                PairOverride = c.TextureSource.PairOverride,
+                Description = c.TextureSource.Describe(),
+                Download = c.SourceQualityDownload is not { } d ? null : new ManifestSourceQualityDownload
+                {
+                    State = d.State, OriginalsRequested = d.Requested,
+                    OriginalsDownloaded = d.Count(SourceQuality.StagedOriginalStatus.Downloaded),
+                    OriginalsAlreadyLocal = d.Count(SourceQuality.StagedOriginalStatus.CachedOriginal),
+                    Description = d.Describe(),
+                    NotRetrieved = d.Files.Where(f => !f.IsAvailable)
+                        .Select(f => new ManifestSourceQualityFailure { Hash = f.Hash, Status = f.Status.ToString(), Message = f.Message }).ToList(),
+                },
             },
             Completeness = new ManifestCompleteness
             {

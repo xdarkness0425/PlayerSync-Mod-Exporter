@@ -1,0 +1,2309 @@
+diff --git a/PlayerSync.SourceQualityExportTest/MSTestSettings.cs b/PlayerSync.SourceQualityExportTest/MSTestSettings.cs
+new file mode 100644
+index 0000000..aaf278c
+--- /dev/null
++++ b/PlayerSync.SourceQualityExportTest/MSTestSettings.cs
+@@ -0,0 +1 @@
++﻿[assembly: Parallelize(Scope = ExecutionScope.MethodLevel)]
+diff --git a/PlayerSync.SourceQualityExportTest/PlayerSync.SourceQualityExportTest.csproj b/PlayerSync.SourceQualityExportTest/PlayerSync.SourceQualityExportTest.csproj
+new file mode 100644
+index 0000000..3f37506
+--- /dev/null
++++ b/PlayerSync.SourceQualityExportTest/PlayerSync.SourceQualityExportTest.csproj
+@@ -0,0 +1,24 @@
++<Project Sdk="Dalamud.NET.Sdk/15.0.0">
++
++  <PropertyGroup>
++    <TargetFramework>net10.0-windows</TargetFramework>
++    <LangVersion>latest</LangVersion>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <UseVSTest>true</UseVSTest>
++    <Platforms>x64</Platforms>
++    <Use_DalamudPackager>false</Use_DalamudPackager>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <ProjectReference Include="..\PlayerSync\PlayerSync.csproj" />
++    <PackageReference Include="MSTest" Version="4.1.0" />
++    <Reference Update="Dalamud">
++      <Private>True</Private>
++    </Reference>
++    <Reference Update="FFXIVClientStructs">
++      <Private>True</Private>
++    </Reference>
++  </ItemGroup>
++
++</Project>
+diff --git a/PlayerSync.SourceQualityExportTest/SourceQualityExportTests.cs b/PlayerSync.SourceQualityExportTest/SourceQualityExportTests.cs
+new file mode 100644
+index 0000000..7d5e7ad
+--- /dev/null
++++ b/PlayerSync.SourceQualityExportTest/SourceQualityExportTests.cs
+@@ -0,0 +1,408 @@
++using K4os.Compression.LZ4.Legacy;
++using MareSynchronos.API.Dto.Files;
++using MareSynchronos.MareConfiguration.Configurations;
++using MareSynchronos.Services.SourceQualityExport;
++using MareSynchronos.WebAPI.Files;
++using System.Security.Cryptography;
++using System.Text;
++
++namespace PlayerSync.SourceQualityExportTest;
++
++/// <summary>
++/// A fake file server and cache: behaves like FileDownloadManager.GetFileInfoAsync / DownloadTransportFileAsync, which write the
++/// un-munged but still LZ4-wrapped file, and like FileCacheManager.GetAllFileCachesByHash(validate: false).
++/// </summary>
++internal sealed class FakeSource : ISourceQualityFileSource
++{
++    public Dictionary<string, DownloadFileDto> Server { get; } = new(StringComparer.OrdinalIgnoreCase);
++    public Dictionary<string, byte[]> Transport { get; } = new(StringComparer.OrdinalIgnoreCase);
++    public Dictionary<string, List<string>> Local { get; } = new(StringComparer.OrdinalIgnoreCase);
++    public List<string> InfoRequests { get; } = [];
++    public List<string> Downloads { get; } = [];
++    public Func<DownloadFileDto, string, CancellationToken, Task>? OnDownload { get; set; }
++
++    public Task<List<DownloadFileDto>> GetFileInfoAsync(List<string> hashes, CancellationToken ct)
++    {
++        lock (InfoRequests)
++            InfoRequests.AddRange(hashes);
++        return Task.FromResult(hashes.Where(Server.ContainsKey).Select(h => Server[h]).ToList());
++    }
++
++    public async Task DownloadTransportFileAsync(DownloadFileDto file, string destinationPath, CancellationToken ct)
++    {
++        lock (Downloads)
++            Downloads.Add(file.Hash);
++        if (OnDownload != null)
++        {
++            await OnDownload(file, destinationPath, ct).ConfigureAwait(false);
++            return;
++        }
++
++        await File.WriteAllBytesAsync(destinationPath, Transport[file.Hash], ct).ConfigureAwait(false);
++    }
++
++    public IEnumerable<string> FindLocalCopies(string hash) => Local.GetValueOrDefault(hash) ?? [];
++}
++
++[TestClass]
++public sealed class SourceQualityExportTests : IDisposable
++{
++    private const string Diffuse = "chara/equipment/e6001/texture/v01_c0201e6001_top_d.tex";
++    private const string Normal = "chara/equipment/e6001/texture/v01_c0201e6001_top_n.tex";
++
++    private readonly string _root = Path.Combine(Path.GetTempPath(), "ps-sq-tests-" + Guid.NewGuid().ToString("N"));
++    private readonly string _staging;
++    private readonly string _cache;
++    private readonly FakeSource _source = new();
++
++    public SourceQualityExportTests()
++    {
++        _staging = Directory.CreateDirectory(Path.Combine(_root, "export", ".psme-staging")).FullName;
++        _cache = Directory.CreateDirectory(Path.Combine(_root, "PlayerSyncCache")).FullName;
++    }
++
++    public void Dispose()
++    {
++        try
++        {
++            Directory.Delete(_root, recursive: true);
++        }
++        catch (IOException)
++        {
++            // best effort
++        }
++    }
++
++    private static byte[] Bytes(int length, int seed)
++    {
++        var b = new byte[length];
++        new Random(seed).NextBytes(b);
++        return b;
++    }
++
++    private static string Sha1(byte[] data) => Convert.ToHexString(SHA1.HashData(data));
++
++    /// <summary>Registers an original (with a compressed alternate on the server) and returns its bytes and hash.</summary>
++    private (byte[] Bytes, string Hash) ServerOriginal(int seed, bool withAlternate = true)
++    {
++        var bytes = Bytes(5000 + seed, seed);
++        var hash = Sha1(bytes);
++        var altBytes = Bytes(1000, seed + 1000);
++        var alt = new DownloadFileDto { Hash = Sha1(altBytes), Size = 1000, DirectDownloadUrl = "https://cdn.invalid/alt" };
++        _source.Server[hash] = new DownloadFileDto
++        {
++            Hash = hash, Size = bytes.Length, DirectDownloadUrl = "https://cdn.invalid/" + hash,
++            CompressedAlternateFileDownload = withAlternate ? alt : null,
++        };
++        _source.Transport[hash] = LZ4Wrapper.Wrap(bytes);
++        _source.Transport[alt.Hash] = LZ4Wrapper.Wrap(altBytes);
++        return (bytes, hash);
++    }
++
++    private SourceQualityExportJob Job(IEnumerable<SourceQualityFileRequest> permitted, IEnumerable<string>? notPermitted = null)
++        => new(_source, _staging, permitted.ToList(), notPermitted ?? []);
++
++    private static SourceQualityFileRequest Req(string hash, string gamePath = Diffuse) => new(hash, "tex", gamePath);
++
++    private Dictionary<string, (string Hash, DateTime Mtime)> Snapshot(string dir)
++        => Directory.GetFiles(dir, "*", SearchOption.AllDirectories)
++            .ToDictionary(f => f, f => (Sha1(File.ReadAllBytes(f)), File.GetLastWriteTimeUtc(f)));
++
++    [TestMethod]
++    public void NormalSynchronization_StillFollowsTheConfiguredPolicy()
++    {
++        Assert.IsFalse(FileDownloadManager.UsesCompressedAlternate(CompressedAlternateUsage.AlwaysSourceQuality));
++        Assert.IsTrue(FileDownloadManager.UsesCompressedAlternate(CompressedAlternateUsage.CompressedNewDownloads));
++        Assert.IsTrue(FileDownloadManager.UsesCompressedAlternate(CompressedAlternateUsage.AlwaysCompressed));
++    }
++
++    [TestMethod]
++    public async Task OriginalHashIsDownloaded_EvenThoughACompressedAlternateExists()
++    {
++        var (bytes, hash) = ServerOriginal(1);
++        var job = Job([Req(hash)]);
++        await job.RunAsync(CancellationToken.None);
++
++        Assert.AreEqual(SourceQualityJobState.Completed, job.State);
++        CollectionAssert.AreEqual(new[] { hash }, _source.Downloads);
++        var r = job.GetResults().Single();
++        Assert.AreEqual(SourceQualityFileStatus.Downloaded, r.Status);
++        Assert.IsTrue(r.Sha1Verified);
++        Assert.AreEqual(Path.Combine(_staging, hash.ToLowerInvariant() + ".tex"), r.Path);
++        CollectionAssert.AreEqual(bytes, File.ReadAllBytes(r.Path!));
++        CollectionAssert.AreEqual(new[] { r.Path }, Directory.GetFiles(_staging)); // no temporary files left
++    }
++
++    [TestMethod]
++    public void OnlyFilesInThePermissionFilteredData_ArePermitted_AndSwapsAreNever()
++    {
++        var synced = new[]
++        {
++            ("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "", new[] { Diffuse }),
++            ("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "chara/other.tex", new[] { Normal }),
++        };
++        var (permitted, notPermitted) = SourceQualityExportService.SelectPermitted(synced,
++            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"]);
++
++        Assert.AreEqual(1, permitted.Count);
++        Assert.AreEqual(("tex", Diffuse), (permitted[0].Extension, permitted[0].GamePath));
++        CollectionAssert.AreEquivalent(new[] { "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" }, notPermitted);
++    }
++
++    [TestMethod]
++    public async Task NotPermittedFiles_AreReported_AndNeverRequestedFromTheServer()
++    {
++        var (_, hash) = ServerOriginal(2);
++        var (_, filtered) = ServerOriginal(3);
++        var job = Job([Req(hash)], [filtered]);
++        await job.RunAsync(CancellationToken.None);
++
++        CollectionAssert.DoesNotContain(_source.InfoRequests, filtered);
++        CollectionAssert.DoesNotContain(_source.Downloads, filtered);
++        Assert.AreEqual(SourceQualityFileStatus.NotPermitted, job.GetResults().Single(r => r.Hash == filtered).Status);
++    }
++
++    [TestMethod]
++    public async Task ForbiddenFile_IsReported_AndNotDownloaded()
++    {
++        var (_, hash) = ServerOriginal(4);
++        _source.Server[hash].IsForbidden = true;
++        _source.Server[hash].ForbiddenBy = "server rules";
++        var job = Job([Req(hash)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var r = job.GetResults().Single();
++        Assert.AreEqual(SourceQualityFileStatus.Forbidden, r.Status);
++        StringAssert.Contains(r.Message, "server rules");
++        Assert.AreEqual(0, _source.Downloads.Count);
++        Assert.AreEqual(0, Directory.GetFiles(_staging).Length);
++    }
++
++    [TestMethod]
++    public async Task OriginalNoLongerOnTheServer_IsReported_NotReplacedByTheAlternate()
++    {
++        var (_, hash) = ServerOriginal(5);
++        _source.Server[hash].FileExists = false;
++        var unknown = Sha1(Bytes(10, 77)); // the server returns nothing for it
++        var job = Job([Req(hash), Req(unknown, Normal)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var byHash = job.GetResults().ToDictionary(r => r.Hash);
++        Assert.AreEqual(SourceQualityFileStatus.NotOnServer, byHash[hash].Status);
++        Assert.AreEqual(SourceQualityFileStatus.Unavailable, byHash[unknown].Status);
++        Assert.AreEqual(0, _source.Downloads.Count);
++    }
++
++    [TestMethod]
++    public async Task CachedOriginal_IsUsedReadOnly_WithoutAnyServerRequest()
++    {
++        var (bytes, hash) = ServerOriginal(6);
++        var cached = Path.Combine(_cache, hash.ToLowerInvariant() + ".tex");
++        await File.WriteAllBytesAsync(cached, bytes);
++        _source.Local[hash] = [cached];
++        var before = Snapshot(_cache);
++
++        var job = Job([Req(hash)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var r = job.GetResults().Single();
++        Assert.AreEqual((SourceQualityFileStatus.CachedOriginal, cached, true), (r.Status, r.Path, r.Sha1Verified));
++        Assert.AreEqual(0, _source.InfoRequests.Count);
++        CollectionAssert.AreEquivalent(before.ToList(), Snapshot(_cache).ToList());
++        Assert.AreEqual(0, Directory.GetFiles(_staging).Length);
++    }
++
++    [TestMethod]
++    public async Task CorruptLocalCopy_IsIgnoredAndLeftAlone_AndTheOriginalIsDownloaded()
++    {
++        var (bytes, hash) = ServerOriginal(7);
++        var corrupt = Path.Combine(_cache, hash.ToLowerInvariant() + ".tex");
++        await File.WriteAllBytesAsync(corrupt, Bytes(100, 8));
++        _source.Local[hash] = [corrupt, Path.Combine(_cache, "gone.tex")];
++        var before = Snapshot(_cache);
++
++        var job = Job([Req(hash)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var r = job.GetResults().Single();
++        Assert.AreEqual(SourceQualityFileStatus.Downloaded, r.Status);
++        CollectionAssert.AreEqual(bytes, File.ReadAllBytes(r.Path!));
++        CollectionAssert.AreEquivalent(before.ToList(), Snapshot(_cache).ToList()); // the cache is never repaired or rewritten
++    }
++
++    [TestMethod]
++    public void Unmunger_UndoesTheServerMunge_AcrossBufferBoundaries()
++    {
++        var plain = Bytes(1000, 9);
++        var key = Encoding.ASCII.GetBytes("k3y-of-odd-length");
++        var output = new List<byte>();
++        var unmunger = TransportCodec.CreateUnmunger("k3y-of-odd-length")!;
++        foreach (var chunk in plain.Select((b, i) => (byte)(b ^ key[i % key.Length])).Chunk(97))
++        {
++            unmunger.Apply(chunk);
++            output.AddRange(chunk);
++        }
++
++        CollectionAssert.AreEqual(plain, output.ToArray());
++        Assert.IsNull(TransportCodec.CreateUnmunger(null));
++        Assert.IsNull(TransportCodec.CreateUnmunger(""));
++    }
++
++    [TestMethod]
++    public void Decode_UnwrapsTheLz4TransportContainer()
++    {
++        var plain = Bytes(70000, 10);
++        CollectionAssert.AreEqual(plain, TransportCodec.Decode(LZ4Wrapper.Wrap(plain)));
++    }
++
++    [TestMethod]
++    public async Task WrongBytesFromTheServer_FailTheSha1Check_AndNothingIsKept()
++    {
++        var (_, hash) = ServerOriginal(11);
++        _source.Transport[hash] = LZ4Wrapper.Wrap(Bytes(5000, 12));
++        var job = Job([Req(hash)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var r = job.GetResults().Single();
++        Assert.AreEqual(SourceQualityFileStatus.HashMismatch, r.Status);
++        Assert.IsNull(r.Path);
++        Assert.AreEqual(0, Directory.GetFiles(_staging).Length);
++    }
++
++    [TestMethod]
++    public async Task UndecodableData_FailedRequest_AndServerErrors_AreReported_WithoutLeftovers()
++    {
++        var (_, garbage) = ServerOriginal(13);
++        _source.Transport[garbage] = Bytes(300, 14);
++        var (_, noFile) = ServerOriginal(15);
++        var (_, http) = ServerOriginal(16);
++        var (_, noUrl) = ServerOriginal(17);
++        _source.Server[noUrl].DirectDownloadUrl = null;
++        _source.OnDownload = async (file, path, ct) =>
++        {
++            if (file.Hash == noFile)
++                return; // DownloadFileThrottled returns without a file when the request fails
++            if (file.Hash == http)
++                throw new InvalidDataException("Http error NotFound");
++            if (string.IsNullOrEmpty(file.DirectDownloadUrl))
++                throw new InvalidDataException("The file server offered no download URL.");
++            await File.WriteAllBytesAsync(path, _source.Transport[file.Hash], ct);
++        };
++
++        var job = Job([Req(garbage), Req(noFile, Normal), Req(http, "a/b.tex"), Req(noUrl, "a/c.tex")]);
++        await job.RunAsync(CancellationToken.None);
++
++        var byHash = job.GetResults().ToDictionary(r => r.Hash);
++        Assert.AreEqual(SourceQualityJobState.Completed, job.State);
++        Assert.AreEqual(SourceQualityFileStatus.Failed, byHash[garbage].Status);
++        Assert.AreEqual(SourceQualityFileStatus.Unavailable, byHash[noFile].Status);
++        Assert.AreEqual(SourceQualityFileStatus.Unavailable, byHash[http].Status);
++        Assert.AreEqual(SourceQualityFileStatus.Unavailable, byHash[noUrl].Status);
++        Assert.AreEqual(0, Directory.GetFiles(_staging).Length);
++    }
++
++    [TestMethod]
++    public async Task Cancellation_DeletesEverythingTheJobCreated_AndNothingElse()
++    {
++        var (_, done) = ServerOriginal(18);
++        var (_, slow) = ServerOriginal(19);
++        var unrelated = Path.Combine(_staging, "exporter-owned.txt");
++        await File.WriteAllTextAsync(unrelated, "keep");
++        using var cts = new CancellationTokenSource();
++        var doneWritten = new TaskCompletionSource();
++        _source.OnDownload = async (file, path, ct) =>
++        {
++            await File.WriteAllBytesAsync(path, file.Hash == done ? _source.Transport[done] : [1, 2, 3], ct);
++            if (file.Hash == done)
++            {
++                doneWritten.TrySetResult();
++                return;
++            }
++
++            await doneWritten.Task;
++            await Task.Delay(50, ct);
++            cts.Cancel();
++            await Task.Delay(Timeout.Infinite, ct);
++        };
++
++        var job = new SourceQualityExportJob(_source, _staging, [Req(done), Req(slow, Normal)], []);
++        await job.RunAsync(cts.Token);
++
++        Assert.AreEqual(SourceQualityJobState.Cancelled, job.State);
++        CollectionAssert.AreEqual(new[] { unrelated }, Directory.GetFiles(_staging));
++        Assert.IsTrue(job.GetResults().All(r => r.Status == SourceQualityFileStatus.Cancelled && r.Path == null));
++    }
++
++    [TestMethod]
++    public async Task MissingStagingFolder_FailsTheJob_WithoutDownloading()
++    {
++        var (_, hash) = ServerOriginal(20);
++        var job = new SourceQualityExportJob(_source, Path.Combine(_root, "does-not-exist"), [Req(hash)], []);
++        await job.RunAsync(CancellationToken.None);
++        Assert.AreEqual(SourceQualityJobState.Failed, job.State);
++        Assert.AreEqual(0, _source.Downloads.Count);
++    }
++
++    [TestMethod]
++    public async Task InvalidHashOrExtension_IsRejected_AndNeverRequested()
++    {
++        var job = Job([new SourceQualityFileRequest("../../evil", "tex", Diffuse), new SourceQualityFileRequest(Sha1(Bytes(5, 1)), "t/x", Diffuse)]);
++        await job.RunAsync(CancellationToken.None);
++        Assert.IsTrue(job.GetResults().All(r => r.Status == SourceQualityFileStatus.Failed));
++        Assert.AreEqual(0, _source.InfoRequests.Count);
++    }
++
++    [TestMethod]
++    public async Task NoFileIsEverWrittenOutsideTheStagingFolder()
++    {
++        var cached = Path.Combine(_cache, "existing.tex");
++        await File.WriteAllBytesAsync(cached, Bytes(50, 21));
++        var outside = Directory.GetFiles(_root, "*", SearchOption.AllDirectories).ToHashSet();
++        var (_, a) = ServerOriginal(22);
++        var (_, b) = ServerOriginal(23);
++        _source.Transport[b] = LZ4Wrapper.Wrap(Bytes(10, 24)); // mismatch
++
++        var job = Job([Req(a), Req(b, Normal)]);
++        await job.RunAsync(CancellationToken.None);
++
++        var created = Directory.GetFiles(_root, "*", SearchOption.AllDirectories).Where(f => !outside.Contains(f)).ToList();
++        Assert.IsTrue(created.All(f => Path.GetDirectoryName(f) == _staging), string.Join(", ", created));
++        Assert.AreEqual(1, created.Count);
++    }
++
++    [TestMethod]
++    public async Task StatusJson_HasTheDocumentedShape()
++    {
++        var (_, hash) = ServerOriginal(25);
++        var job = Job([Req(hash)], ["DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"]);
++        await job.RunAsync(CancellationToken.None);
++        var json = SourceQualityExportService.SerializeStatus(job);
++
++        using var doc = System.Text.Json.JsonDocument.Parse(json);
++        Assert.AreEqual("Completed", doc.RootElement.GetProperty("state").GetString());
++        var files = doc.RootElement.GetProperty("files").EnumerateArray().ToList();
++        Assert.AreEqual(2, files.Count);
++        var downloaded = files.Single(f => f.GetProperty("hash").GetString() == hash);
++        Assert.AreEqual("Downloaded", downloaded.GetProperty("status").GetString());
++        Assert.IsTrue(downloaded.GetProperty("sha1Verified").GetBoolean());
++        Assert.AreEqual(Diffuse, downloaded.GetProperty("gamePath").GetString());
++        Assert.IsFalse(string.IsNullOrEmpty(downloaded.GetProperty("path").GetString()));
++        Assert.AreEqual("NotPermitted", files.Single(f => f.GetProperty("hash").GetString()!.StartsWith('D')).GetProperty("status").GetString());
++    }
++
++    [TestMethod]
++    public void StagingFolder_MustExist_AndBeOutsideTheCacheAndPenumbra()
++    {
++        var penumbra = Directory.CreateDirectory(Path.Combine(_root, "Penumbra")).FullName;
++        var inCache = Directory.CreateDirectory(Path.Combine(_cache, "sub")).FullName;
++        var inPenumbra = Directory.CreateDirectory(Path.Combine(penumbra, "sub")).FullName;
++
++        Assert.IsNull(SourceQualityExportService.StagingError(_staging, _cache, penumbra));
++        Assert.IsNotNull(SourceQualityExportService.StagingError(inCache, _cache, penumbra));
++        Assert.IsNotNull(SourceQualityExportService.StagingError(_cache, _cache, penumbra));
++        Assert.IsNotNull(SourceQualityExportService.StagingError(inPenumbra, _cache, penumbra));
++        Assert.IsNotNull(SourceQualityExportService.StagingError(_root, _cache, penumbra)); // contains the cache
++        Assert.IsNotNull(SourceQualityExportService.StagingError(Path.Combine(_root, "missing"), _cache, penumbra));
++        Assert.IsNotNull(SourceQualityExportService.StagingError("relative/path", _cache, penumbra));
++    }
++}
+diff --git a/PlayerSync.SourceQualityExportTest/packages.lock.json b/PlayerSync.SourceQualityExportTest/packages.lock.json
+new file mode 100644
+index 0000000..fe35e6e
+--- /dev/null
++++ b/PlayerSync.SourceQualityExportTest/packages.lock.json
+@@ -0,0 +1,971 @@
++{
++  "version": 1,
++  "dependencies": {
++    "net10.0-windows7.0": {
++      "DotNet.ReproducibleBuilds": {
++        "type": "Direct",
++        "requested": "[1.2.39, )",
++        "resolved": "1.2.39",
++        "contentHash": "fcFN01tDTIQqDuTwr1jUQK/geofiwjG5DycJQOnC72i1SsLAk1ELe+apBOuZ11UMQG8YKFZG1FgvjZPbqHyatg=="
++      },
++      "MSTest": {
++        "type": "Direct",
++        "requested": "[4.1.0, )",
++        "resolved": "4.1.0",
++        "contentHash": "2bk47yg7HcHRyf6Zf0XgCZicTVTQj4D5lonYTO7lWMxCQB+x66VrQNc2dADBfzthKXfHaA37m8i+VV5h6SbWiA==",
++        "dependencies": {
++          "MSTest.TestAdapter": "4.1.0",
++          "MSTest.TestFramework": "4.1.0",
++          "Microsoft.NET.Test.Sdk": "18.0.1",
++          "Microsoft.Testing.Extensions.CodeCoverage": "18.4.1",
++          "Microsoft.Testing.Extensions.TrxReport": "2.1.0"
++        }
++      },
++      "BCnEncoder.Net": {
++        "type": "Transitive",
++        "resolved": "2.3.0",
++        "contentHash": "DJhHJiBJKXUXxlkkrv74ckzJb3wYxqIAZHjXD9G76kpsD0YyJOmqtNufHWEuJe0eH0tB1tCZn80/3JV2UVP7yQ==",
++        "dependencies": {
++          "CommunityToolkit.HighPerformance": "8.4.0"
++        }
++      },
++      "Brio.API": {
++        "type": "Transitive",
++        "resolved": "3.0.1",
++        "contentHash": "40MD49ETqyGsdHGoG3JF/BFcNAphRqi27+ZxfDk2Aj7gAkzDFe7C2UVGirUByrUIj8lxiz9eEoB2i7O9lefEPQ=="
++      },
++      "CommunityToolkit.Common": {
++        "type": "Transitive",
++        "resolved": "8.3.2",
++        "contentHash": "DFk1MUDzCUZHWFGl33HQkD1XtHHKmgfnjJ6sD2JICDc6et4DaCxf6GBPCzAZ7jcgyy/BdUDk0DUztu1K+61Q6w=="
++      },
++      "CommunityToolkit.Diagnostics": {
++        "type": "Transitive",
++        "resolved": "8.3.2",
++        "contentHash": "YyMsBE9lT0pJg2bEDzlfEWdlk6xHExW6jr1dxC7+YUqqVmOGL5nZROpxbXQRTe5TrfIs7BvkVsGULv/hq6tGIA=="
++      },
++      "CommunityToolkit.HighPerformance": {
++        "type": "Transitive",
++        "resolved": "8.4.0",
++        "contentHash": "flxspiBs0G/0GMp7IK2J2ijV9bTG6hEwFc/z6ekHqB6nwRJ4Ry2yLdx+TkbCUYFCl4XhABkAwomeKbT6zM2Zlg=="
++      },
++      "CommunityToolkit.Mvvm": {
++        "type": "Transitive",
++        "resolved": "8.3.2",
++        "contentHash": "m8EolE1A0Updj68WTsZSGI6VWb6mUqHPh7QFo0kt7+JPhYMNXRS1ch8TS/oITAdcxTLrwMOp3ku1KjeG1/Zdpg=="
++      },
++      "Cyotek.Drawing.BitmapFont": {
++        "type": "Transitive",
++        "resolved": "2.0.4",
++        "contentHash": "iA6WehGVdMUuNbfsQQDq/Bt+mMd/OqHjiMUtKFLIQd/0pyYh4ehT7FEjTxN9/4OXNKQZsp9bAJgltP2nnswUJg=="
++      },
++      "DalamudPackager": {
++        "type": "Transitive",
++        "resolved": "15.0.0",
++        "contentHash": "411vwC8/X8Z/sQ2TI6v3SvOn66xFPeOjFn3Zn+h0d3Ox2t1kFm66AhDvmx/qcMwVrR+Hidxj0dadpQ2dgyXMBQ=="
++      },
++      "DnsClient": {
++        "type": "Transitive",
++        "resolved": "1.8.0",
++        "contentHash": "RRwtaCXkXWsx0mmsReGDqCbRLtItfUbkRJlet1FpdciVhyMGKcPd57T1+8Jki9ojHlq9fntVhXQroOOgRak8DQ=="
++      },
++      "Downloader": {
++        "type": "Transitive",
++        "resolved": "4.0.3",
++        "contentHash": "Vg1+UqPDstpMw2CKXV9XvB8jKHC95KQfbqPxQXvOMRMFnTov4Ixvvw6GZV5DXLnKuL2sfnmVYX9CaQtcURia1Q==",
++        "dependencies": {
++          "Microsoft.Extensions.Logging.Abstractions": "8.0.3"
++        }
++      },
++      "FlatSharp.Compiler": {
++        "type": "Transitive",
++        "resolved": "7.9.0",
++        "contentHash": "MU6808xvdbWJ3Ev+5PKalqQuzvVbn1DzzQH8txRDHGFUNDvHjd+ejqpvnYc9BSJ8Qp8VjkkpJD8OzRYilbPp3A=="
++      },
++      "FlatSharp.Runtime": {
++        "type": "Transitive",
++        "resolved": "7.9.0",
++        "contentHash": "Bm8+WqzEsWNpxqrD5x4x+zQ8dyINlToCreM5FI2oNSfUVc9U9ZB+qztX/jd8rlJb3r0vBSlPwVLpw0xBtPa3Vw=="
++      },
++      "Glamourer.Api": {
++        "type": "Transitive",
++        "resolved": "2.8.0",
++        "contentHash": "dCxycU+lA0qraE70ZoRvM4GQAPq/K+qL/bg6t/kxKPox5GWaiunKOTXNOG2hOvgEda5WtFy6e3c9OuIM6L3faQ=="
++      },
++      "Google.FlatBuffers": {
++        "type": "Transitive",
++        "resolved": "25.2.10",
++        "contentHash": "z3ykbSRsy6oqMzeZ84a+K8rnMJ/ysVikar8r2yUhHz0HSxIjBpj53mZvpu6LjLEm5fLLWQsCdelJwL1nu7lloA=="
++      },
++      "HelixToolkit": {
++        "type": "Transitive",
++        "resolved": "3.1.2",
++        "contentHash": "SicJqlyFmG7ub5o7cxUbYK3wb0EJCe7v+MIuQS4f9nKyc3EZ0VK92ptCHzVI1AJOPGWIod7pfZoA3F99Nu1M/g==",
++        "dependencies": {
++          "CommunityToolkit.Common": "8.3.2",
++          "CommunityToolkit.Diagnostics": "8.3.2",
++          "CommunityToolkit.Mvvm": "8.3.2",
++          "Microsoft.Extensions.Logging.Abstractions": "8.0.2"
++        }
++      },
++      "HelixToolkit.Geometry": {
++        "type": "Transitive",
++        "resolved": "3.1.2",
++        "contentHash": "NHDQfiMuwlGqLEEzXj4Z4qi9s81x2wc0J7c9dfDWwjqTBKzBFKYeBNV+KSQ+i6L+fytWBBp6dL9G1Pg8B+yzBQ==",
++        "dependencies": {
++          "CommunityToolkit.Common": "8.3.2",
++          "CommunityToolkit.Diagnostics": "8.3.2",
++          "CommunityToolkit.Mvvm": "8.3.2",
++          "HelixToolkit": "3.1.2",
++          "HelixToolkit.Maths": "3.1.2",
++          "Microsoft.Extensions.Logging.Abstractions": "8.0.2"
++        }
++      },
++      "HelixToolkit.Maths": {
++        "type": "Transitive",
++        "resolved": "3.1.2",
++        "contentHash": "sKVK+nSjR3dTFEQ1T3P0xDxbdDI/oJCQAe0v7NCqSDAd3mddUwGSyE6+3T9oFBCQY6AYPCCTQpkzVqVVxnnN9Q==",
++        "dependencies": {
++          "HelixToolkit": "3.1.2"
++        }
++      },
++      "HelixToolkit.SharpDX": {
++        "type": "Transitive",
++        "resolved": "3.1.2",
++        "contentHash": "9EJ6KrUt/v8U05D5EpQObNHM5cLTqlMDpS4dNJgjzRKrTlU3X8XmuMwHt2bleQCuBYsjIDosWmQhTHcSD1sMmA==",
++        "dependencies": {
++          "CommunityToolkit.Common": "8.3.2",
++          "CommunityToolkit.Diagnostics": "8.3.2",
++          "CommunityToolkit.Mvvm": "8.3.2",
++          "Cyotek.Drawing.BitmapFont": "2.0.4",
++          "HelixToolkit": "3.1.2",
++          "HelixToolkit.Geometry": "3.1.2",
++          "HelixToolkit.Maths": "3.1.2",
++          "Microsoft.CodeAnalysis.CSharp": "4.11.0",
++          "SharpDX.D3DCompiler": "4.2.0",
++          "SharpDX.DXGI": "4.2.0",
++          "SharpDX.Direct2D1": "4.2.0",
++          "SharpDX.Direct3D11": "4.2.0"
++        }
++      },
++      "K4os.Compression.LZ4": {
++        "type": "Transitive",
++        "resolved": "1.3.8",
++        "contentHash": "LhwlPa7c1zs1OV2XadMtAWdImjLIsqFJPoRcIWAadSRn0Ri1DepK65UbWLPmt4riLqx2d40xjXRk0ogpqNtK7g=="
++      },
++      "K4os.Compression.LZ4.Legacy": {
++        "type": "Transitive",
++        "resolved": "1.3.8",
++        "contentHash": "+82CK5zXbGjMnVLm2JJpsSAz3+4CRcMmxUDOmehUh1bDjrmpnc5VHxB14hiV1lXtqe53lNI+O76BQvgWhgI66g==",
++        "dependencies": {
++          "K4os.Compression.LZ4": "1.3.8"
++        }
++      },
++      "Loci.Api": {
++        "type": "Transitive",
++        "resolved": "0.1.0",
++        "contentHash": "eDkyUzwJS0gD9EPR/k4h1GZ5p2wCcKuWn+MGDbN/gWQI2DlgSWv/EIHmvyEtj9VdVhotFglGtvF1531c6B4Rew=="
++      },
++      "MessagePack": {
++        "type": "Transitive",
++        "resolved": "3.1.8",
++        "contentHash": "Qk2q+9FVxnMSp+NQ9y3SLz3HqWe7Rg3KRMHhBX28FkKUoOeP9YIU86mA4pFOxDDjUIRA9e7Ssbxs/LwWUcAzPw==",
++        "dependencies": {
++          "MessagePack.Annotations": "3.1.8",
++          "MessagePackAnalyzer": "3.1.8",
++          "Microsoft.NET.StringTools": "17.11.4"
++        }
++      },
++      "MessagePack.Annotations": {
++        "type": "Transitive",
++        "resolved": "3.1.8",
++        "contentHash": "SitOtZ4tOlAZZPF7p52M7143F+Cuz7o/aU0MrtAXX0+ZkPXzDNroOFhzzE2ogMFThsoEW/E6akXVVcBFM9ZKaw=="
++      },
++      "MessagePackAnalyzer": {
++        "type": "Transitive",
++        "resolved": "3.1.8",
++        "contentHash": "Vm4g0cR4YRKRchEOmMJ0uVFU6yxdg7cJa2KHv3SUAHEsdYKvMpHMF5A1hZfsix89ymD5cmuzRnw9a6dKMcvq+Q=="
++      },
++      "mgholam.fastCSV": {
++        "type": "Transitive",
++        "resolved": "2.0.9",
++        "contentHash": "AOFqanoVebasDk/X1qm7X9/q/UwTz6/fpNFfqsEh6K1euTV9CxknPIhlLpo6CHlhiyMUs1/vv+g+KE8C8VYGcg=="
++      },
++      "Microsoft.ApplicationInsights": {
++        "type": "Transitive",
++        "resolved": "2.23.0",
++        "contentHash": "nWArUZTdU7iqZLycLKWe0TDms48KKGE6pONH2terYNa8REXiqixrMOkf1sk5DHGMaUTqONU2YkS4SAXBhLStgw=="
++      },
++      "Microsoft.AspNetCore.Connections.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "DCrayFIb+t+P9EI6NAP8BmAIgi51lrdmdtMAQnZf2v2J51q5ptOMR2rzfhvSMAZZhYReAK4H+ZTprf8Q5rOnzw==",
++        "dependencies": {
++          "Microsoft.Extensions.Features": "10.0.11"
++        }
++      },
++      "Microsoft.AspNetCore.Http.Connections.Client": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "wHXxSYZnXYom4sHWZMzGgngIpHBIG0M1/i5HfLF6tQjBpx399OdTwC+BO1yYjbTr6RyWHx4UglRGYNs+6fpUkA==",
++        "dependencies": {
++          "Microsoft.AspNetCore.Http.Connections.Common": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10"
++        }
++      },
++      "Microsoft.AspNetCore.Http.Connections.Common": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "EARfS3nepXK/b3P3ROPKV4euaHuBRFpa63dmy9TSN0qS8Dp/lQAR+RB/Yhlm5CMXvvyr42Ue1QV/dN8XeGXD3w==",
++        "dependencies": {
++          "Microsoft.AspNetCore.Connections.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.AspNetCore.SignalR.Client": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "TQDXsU5mTtI1el77bS55FoNYi1CPIuPoKUDp6W/j22FA/ajHMjgmeikC87UPiZkdiJDjNyCehj91YMGNi3xCDg==",
++        "dependencies": {
++          "Microsoft.AspNetCore.Http.Connections.Client": "9.0.10",
++          "Microsoft.AspNetCore.SignalR.Client.Core": "9.0.10"
++        }
++      },
++      "Microsoft.AspNetCore.SignalR.Client.Core": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "LxnasvhMSG7L+asb88VN7Z6yr0PJTdOdN8UnGtZClySbiSIQGMtsaoCNmQxT9AA6Yvb7QBA0/H+4AGDrT34Xew==",
++        "dependencies": {
++          "Microsoft.AspNetCore.SignalR.Common": "9.0.10",
++          "Microsoft.AspNetCore.SignalR.Protocols.Json": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10"
++        }
++      },
++      "Microsoft.AspNetCore.SignalR.Common": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "fDg4cdP3q4VTxNdp+oy1Ju+7Zi12pFEtQQVeQu3oOXwaIh2KwprmebI+zgfQZQSimQx0DSoWUB87sKiyDaT9nA==",
++        "dependencies": {
++          "Microsoft.AspNetCore.Connections.Abstractions": "10.0.11",
++          "Microsoft.Extensions.Options": "10.0.11"
++        }
++      },
++      "Microsoft.AspNetCore.SignalR.Protocols.Json": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "AhBUSG98Us2LLW3FjhtAaa6x0zL1jyjjYYZ0CSCoi9fmIuOLl/5WxXOP48VsrChi6NpZ3C31yHpScl4vqLdPcA==",
++        "dependencies": {
++          "Microsoft.AspNetCore.SignalR.Common": "9.0.10"
++        }
++      },
++      "Microsoft.AspNetCore.SignalR.Protocols.MessagePack": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "rZXe/AAxEMCYcya2CqK7veMVavIm04+CLOyXpmU1clXJ0MMaU2OogU0e8kshN2/ahOhYC54HkkOFr/gFvNtJBw==",
++        "dependencies": {
++          "MessagePack": "2.5.302",
++          "Microsoft.AspNetCore.SignalR.Common": "10.0.11"
++        }
++      },
++      "Microsoft.CodeAnalysis.Analyzers": {
++        "type": "Transitive",
++        "resolved": "3.3.4",
++        "contentHash": "AxkxcPR+rheX0SmvpLVIGLhOUXAKG56a64kV9VQZ4y9gR9ZmPXnqZvHJnmwLSwzrEP6junUF11vuc+aqo5r68g=="
++      },
++      "Microsoft.CodeAnalysis.Common": {
++        "type": "Transitive",
++        "resolved": "4.11.0",
++        "contentHash": "djf8ujmqYImFgB04UGtcsEhHrzVqzHowS+EEl/Yunc5LdrYrZhGBWUTXoCF0NzYXJxtfuD+UVQarWpvrNc94Qg==",
++        "dependencies": {
++          "Microsoft.CodeAnalysis.Analyzers": "3.3.4"
++        }
++      },
++      "Microsoft.CodeAnalysis.CSharp": {
++        "type": "Transitive",
++        "resolved": "4.11.0",
++        "contentHash": "6XYi2EusI8JT4y2l/F3VVVS+ISoIX9nqHsZRaG6W5aFeJ5BEuBosHfT/ABb73FN0RZ1Z3cj2j7cL28SToJPXOw==",
++        "dependencies": {
++          "Microsoft.CodeAnalysis.Analyzers": "3.3.4",
++          "Microsoft.CodeAnalysis.Common": "[4.11.0]"
++        }
++      },
++      "Microsoft.CodeCoverage": {
++        "type": "Transitive",
++        "resolved": "18.0.1",
++        "contentHash": "O+utSr97NAJowIQT/OVp3Lh9QgW/wALVTP4RG1m2AfFP4IyJmJz0ZBmFJUsRQiAPgq6IRC0t8AAzsiPIsaUDEA=="
++      },
++      "Microsoft.DiaSymReader": {
++        "type": "Transitive",
++        "resolved": "2.0.0",
++        "contentHash": "QcZrCETsBJqy/vQpFtJc+jSXQ0K5sucQ6NUFbTNVHD4vfZZOwjZ/3sBzczkC4DityhD3AVO/+K/+9ioLs1AgRA=="
++      },
++      "Microsoft.Extensions.Configuration": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "UAm3SLGAMlJdowbN+/xnh2UGJkdJoXVm4MsdhZ60dAMS8jteoyCx5WfIab5DKv0TCYpdhVecLJVUjEO3abs9UQ==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Abstractions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "ad3JxmFj0uxuFa1CT6oxTCC1lQ0xeRuOvzBRFT/I/ofIXVOnNsH/v2GZkAJWhlpZqKUvSexQZzp3EEAB2CdtJg==",
++        "dependencies": {
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Binder": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "D6Kng+9I+w1SQPxJybc6wzw9nnnyUQPutycjtI0svv1RHaWOpUk9PPlwIRfhhoQZ3yihejkEI2wNv/7VnVtkGA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.CommandLine": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Sg400UyKl33kOpqklEg1MIM3lpY/aWi7QZTB2JfFpKgxnSRQl9J6tHiKYll+Rd603P+71YsDy/zqBYUE/3Xeag==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.EnvironmentVariables": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Nje8x5JDRi7uzf2q3NpXiBleRRJAxJMnHcJTi0tLyqd6eGIICRuF6qxgZssMS1r8xXDoaUr/2ZLQ6Cui1Io+Qw==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.FileExtensions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "kYWY9VRoCKQJCLKAA4Wqn74FVnytqosF7vFq1chJ8st9mGZS6SQrkoZg7GmcpqrRRUWmWDOZI4nFdoFnxsI/Ug==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Physical": "9.0.10",
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.Json": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "bn+qnwuOaDelax8PUw30UTjLOuEd0lGWqUG4Z+oVr4D/gEWouCWOyvCVkyn+PWbftPlnmAmWxd4J+7ljwE8wVw==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Configuration.FileExtensions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Configuration.UserSecrets": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "l7em+qNfEdGlwRm8Qk2rkzqjT8xWb/EosoQeTvJ3kZYiRo5inMj0nNcZw51dUKwGO/LW7uNMdqNNU3P0pB5JqA==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Configuration.Json": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Physical": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.DependencyInjection": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "iEtXCkNd5XhjNJAOb/wO4IhDRdLIE2CsPxZggZQWJ/q2+sa8dmEPC393nnsiqdH8/4KV8Xn25IzgKPR1UEQ0og==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.DependencyInjection.Abstractions": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "/a1aJz4m7ylhEDf25ugQChLQoN5XwoGjWw/BoR/ZWWKsO1v4DdJElS1uyngahz4B/eOzjFk1KNTkarRLE5wsIg=="
++      },
++      "Microsoft.Extensions.DependencyModel": {
++        "type": "Transitive",
++        "resolved": "8.0.2",
++        "contentHash": "mUBDZZRgZrSyFOsJ2qJJ9fXfqd/kXJwf3AiDoqLD9m6TjY5OO/vLNOb9fb4juC0487eq4hcGN/M2Rh/CKS7QYw=="
++      },
++      "Microsoft.Extensions.Diagnostics": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "01x2vz0AbIdfNUzEVYFq2HSeq1BmrSDpiG7nTmwjfd0d39sahQ8T7dhSXhH+YnZyaLWyMBudOq0vVa/voyNWjg==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Diagnostics.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options.ConfigurationExtensions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Diagnostics.Abstractions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "iwVnYi+gNKrr5riw8YFCoLCN4s0dmHtzfUmV99RIhrz8R4d6C/bsKzXhIhZWDIxJOhVzB+idSOQeRGj1/oMF+Q==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Features": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "/ro7Ate9LihDcZP6ukTwUjFj3dBzz7tijNcGg4aYBa3RkjqC/cOPqxZtMrOS3RU3nhRLHX8WTKq9EKL/4V4r5A=="
++      },
++      "Microsoft.Extensions.FileProviders.Abstractions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "3+cLxZKUWBbpfIXLLuKcEok9C91PsV1h5xxfUsEnLSXXLNMiPDfrhpb1xajNFcejFPs9Ck/Fi3z71hYDqFBwYg==",
++        "dependencies": {
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.FileProviders.Physical": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Eg3YOEMpHWZzAgPD9YvGkQSv97AtG3II6maRQV/voDRORh4bRiyl0mVtT2PKnu1JoD9rJeYgjGCwRvVWMBaqgQ==",
++        "dependencies": {
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileSystemGlobbing": "9.0.10",
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.FileSystemGlobbing": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "KdZAM2YMYBipVp/4tSEWPLnrocd17SL4iaXdgXjR5/nheBXbfR5QfPWYoTyh6C6IW3uKR7TRMwQr2qCvtaCTiA=="
++      },
++      "Microsoft.Extensions.Hosting": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "63yDlitelCBNl1unJsnEWVUCZHOtxbVTbTODi7cszQJBG9bIfdPYIpB9w0UIcoqVSP1C9P6THXgukx8APWRzMw==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Configuration.Binder": "9.0.10",
++          "Microsoft.Extensions.Configuration.CommandLine": "9.0.10",
++          "Microsoft.Extensions.Configuration.EnvironmentVariables": "9.0.10",
++          "Microsoft.Extensions.Configuration.FileExtensions": "9.0.10",
++          "Microsoft.Extensions.Configuration.Json": "9.0.10",
++          "Microsoft.Extensions.Configuration.UserSecrets": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Diagnostics": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Physical": "9.0.10",
++          "Microsoft.Extensions.Hosting.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging.Configuration": "9.0.10",
++          "Microsoft.Extensions.Logging.Console": "9.0.10",
++          "Microsoft.Extensions.Logging.Debug": "9.0.10",
++          "Microsoft.Extensions.Logging.EventLog": "9.0.10",
++          "Microsoft.Extensions.Logging.EventSource": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Hosting.Abstractions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "spfXydiEQENFwxdgr3Y57wwys/FRjfmq5VjHGPh6ct1FJK7X+qNEWYbnZJCMqq0B0oJTMvnItAReOv4mi2Idog==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Diagnostics.Abstractions": "9.0.10",
++          "Microsoft.Extensions.FileProviders.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "UBXHqE9vyptVhaFnT1R7YJKCve7TqVI10yjjUZBNGMlW2lZ4c031Slt9hxsOzWCzlpPxxIFyf1Yk4a6Iubxx7w==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.Abstractions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "MFUPv/nN1rAQ19w43smm6bbf0JDYN/1HEPHoiMYY50pvDMFpglzWAuoTavByDmZq7UuhjaxwrET3joU69ZHoHQ==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.Configuration": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "qwTRpxrmLOXZrbgQHRZ9wS2AtVa/61DFIYk8k1rBCCgA5qW0MBxxQC4BjkaI0wSoHHOv/IUXBeFNK+Y59qe/Ug==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration": "9.0.10",
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Configuration.Binder": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10",
++          "Microsoft.Extensions.Options.ConfigurationExtensions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.Console": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "ponA8k4E4S0LlQ8J4ce4Yp1NND8rxww0lbADK9yL3omRpnnawiENb7W/CTgZUIZVJxKcmIwhm1IbUCRk6RLocQ==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging.Configuration": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.Debug": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Uj4YMaMMLawIkpHYnDWsR2/pufV/8X3dDT1/RNhkmt8RRf6/SriyA2gxH6I6bj4gFx6yMuFWZhCgFLy3wcSGTw==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.EventLog": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Son+9zr7gnuYv1CcuZ8b6XhZK/UQRG88Ku1iSUvAQSZ1cFjYC+lDYRD6nBVXF2QIQyv0jhjt/MPKD7sA+323TQ==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10",
++          "System.Diagnostics.EventLog": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Logging.EventSource": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "qhqkUWsf/CVyQ9V98n5uWSQcvy7HbyRkhyhpK75OKojWuaNKoEIfBmrHRiahmdGJDuh2Qz/nDpFOjQOi/ERtZQ==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Logging": "9.0.10",
++          "Microsoft.Extensions.Logging.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10",
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Options": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "eY1GAKcTfD2maP27J84X9IovT3yjHJ2dVDzPmDg6/XqYvt3jMzJhtfQCLjG9pVsZGAd+8DQ2QrjaDcs2+VQLGw==",
++        "dependencies": {
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "10.0.11",
++          "Microsoft.Extensions.Primitives": "10.0.11"
++        }
++      },
++      "Microsoft.Extensions.Options.ConfigurationExtensions": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "wLsf2TyVFFxWQPv0PRJj365it1ngIt8utlHJWSZ9OJ2k+NDa/PtBIRsGlF/NkoLwm1m+1vOePNl2MiKfk6lYfQ==",
++        "dependencies": {
++          "Microsoft.Extensions.Configuration.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Configuration.Binder": "9.0.10",
++          "Microsoft.Extensions.DependencyInjection.Abstractions": "9.0.10",
++          "Microsoft.Extensions.Options": "9.0.10",
++          "Microsoft.Extensions.Primitives": "9.0.10"
++        }
++      },
++      "Microsoft.Extensions.Primitives": {
++        "type": "Transitive",
++        "resolved": "10.0.11",
++        "contentHash": "SXcz+kF+4Oo9b1+55zntpJFYfwb1jw66ioxptyNOOTDc8g2FHnBFWjZpsWfCvZIhzr0x+4e2trVTs4OKwQfBtw=="
++      },
++      "Microsoft.IdentityModel.Abstractions": {
++        "type": "Transitive",
++        "resolved": "8.14.0",
++        "contentHash": "iwbCpSjD3ehfTwBhtSNEtKPK0ICun6ov7Ibx6ISNA9bfwIyzI2Siwyi9eJFCJBwxowK9xcA1mj+jBWiigeqgcQ=="
++      },
++      "Microsoft.IdentityModel.JsonWebTokens": {
++        "type": "Transitive",
++        "resolved": "8.14.0",
++        "contentHash": "4jOpiA4THdtpLyMdAb24dtj7+6GmvhOhxf5XHLYWmPKF8ApEnApal1UnJsKO4HxUWRXDA6C4WQVfYyqsRhpNpQ==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Tokens": "8.14.0"
++        }
++      },
++      "Microsoft.IdentityModel.Logging": {
++        "type": "Transitive",
++        "resolved": "8.14.0",
++        "contentHash": "eqqnemdW38CKZEHS6diA50BV94QICozDZEvSrsvN3SJXUFwVB9gy+/oz76gldP7nZliA16IglXjXTCTdmU/Ejg==",
++        "dependencies": {
++          "Microsoft.IdentityModel.Abstractions": "8.14.0"
++        }
++      },
++      "Microsoft.IdentityModel.Tokens": {
++        "type": "Transitive",
++        "resolved": "8.14.0",
++        "contentHash": "lKIZiBiGd36k02TCdMHp1KlNWisyIvQxcYJvIkz7P4gSQ9zi8dgh6S5Grj8NNG7HWYIPfQymGyoZ6JB5d1Lo1g==",
++        "dependencies": {
++          "Microsoft.Extensions.Logging.Abstractions": "8.0.0",
++          "Microsoft.IdentityModel.Logging": "8.14.0"
++        }
++      },
++      "Microsoft.NET.StringTools": {
++        "type": "Transitive",
++        "resolved": "17.11.4",
++        "contentHash": "mudqUHhNpeqIdJoUx2YDWZO/I9uEDYVowan89R6wsomfnUJQk6HteoQTlNjZDixhT2B4IXMkMtgZtoceIjLRmA=="
++      },
++      "Microsoft.NET.Test.Sdk": {
++        "type": "Transitive",
++        "resolved": "18.0.1",
++        "contentHash": "WNpu6vI2rA0pXY4r7NKxCN16XRWl5uHu6qjuyVLoDo6oYEggIQefrMjkRuibQHm/NslIUNCcKftvoWAN80MSAg==",
++        "dependencies": {
++          "Microsoft.CodeCoverage": "18.0.1",
++          "Microsoft.TestPlatform.TestHost": "18.0.1"
++        }
++      },
++      "Microsoft.NETCore.Platforms": {
++        "type": "Transitive",
++        "resolved": "1.1.0",
++        "contentHash": "kz0PEW2lhqygehI/d6XsPCQzD7ff7gUJaVGPVETX611eadGsA3A877GdSlU0LRVMCTH/+P3o2iDTak+S08V2+A=="
++      },
++      "Microsoft.Testing.Extensions.CodeCoverage": {
++        "type": "Transitive",
++        "resolved": "18.4.1",
++        "contentHash": "l1VZM9dg9s76L5D288ipAT4HRYDJ6Vxh8wX20gfS9VnpueedRfN4/aGNn4oA1g6pwq2WSM3Ci7IoSSGPiqu+WQ==",
++        "dependencies": {
++          "Microsoft.DiaSymReader": "2.0.0",
++          "Microsoft.Extensions.DependencyModel": "8.0.2",
++          "Microsoft.Testing.Platform": "2.0.2"
++        }
++      },
++      "Microsoft.Testing.Extensions.Telemetry": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "5TwgTx2u7k9Al/xbZ18QXq4Hdy2xewkVTI6K3sk+jY2ykqUkIKNuj7rFu3GOV5KnEUkevhw6eZcyZs77STHJIA==",
++        "dependencies": {
++          "Microsoft.ApplicationInsights": "2.23.0",
++          "Microsoft.Testing.Platform": "2.1.0"
++        }
++      },
++      "Microsoft.Testing.Extensions.TrxReport": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "cXmP225WcMLLOSrW8xekaNhfzdBwXX3cbXbE5qSzmLbK0KZe3z8rAObKj70FWiPPPzm2W22x0ZW93gsmAfK6Mg==",
++        "dependencies": {
++          "Microsoft.Testing.Extensions.TrxReport.Abstractions": "2.1.0",
++          "Microsoft.Testing.Platform": "2.1.0"
++        }
++      },
++      "Microsoft.Testing.Extensions.TrxReport.Abstractions": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "D8xmIJYQFJ6D49Rx5/vPrkZZxb338Jkew+eSqZLBfBiWKw4QZKy3i1BOXiLfz0lOmaNErwDz/YWRojCdNl+B9Q==",
++        "dependencies": {
++          "Microsoft.Testing.Platform": "2.1.0"
++        }
++      },
++      "Microsoft.Testing.Extensions.VSTestBridge": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "bNRIEA2YoGr+Y+7LHdA7i1U80+7BAdf4K4Qh4Kx6eKkoBK/NV7QpoMg+GWPP0/eqAFzuUmUOIPVZ87Oo0Vyxmw==",
++        "dependencies": {
++          "Microsoft.TestPlatform.ObjectModel": "18.0.1",
++          "Microsoft.Testing.Extensions.Telemetry": "2.1.0",
++          "Microsoft.Testing.Extensions.TrxReport.Abstractions": "2.1.0",
++          "Microsoft.Testing.Platform": "2.1.0"
++        }
++      },
++      "Microsoft.Testing.Platform": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "aHkjNTGIA+Zbdw6RJgSFrbDrCjO0CgqpElqYcvkRSeUhBv2bKarnvU3ep786U7UqrPlArT/B7VmImRibJD0Zrg=="
++      },
++      "Microsoft.Testing.Platform.MSBuild": {
++        "type": "Transitive",
++        "resolved": "2.1.0",
++        "contentHash": "UpfPebXQtHGrWz21+YLHmJSm+5zsuPE9U9pfdCtoB+67g75fDmWlNgpkH2ZmdVhSwkjNIed9Icg8Iu63z2ei5Q==",
++        "dependencies": {
++          "Microsoft.Testing.Platform": "2.1.0"
++        }
++      },
++      "Microsoft.TestPlatform.ObjectModel": {
++        "type": "Transitive",
++        "resolved": "18.0.1",
++        "contentHash": "qT/mwMcLF9BieRkzOBPL2qCopl8hQu6A1P7JWAoj/FMu5i9vds/7cjbJ/LLtaiwWevWLAeD5v5wjQJ/l6jvhWQ=="
++      },
++      "Microsoft.TestPlatform.TestHost": {
++        "type": "Transitive",
++        "resolved": "18.0.1",
++        "contentHash": "uDJKAEjFTaa2wHdWlfo6ektyoh+WD4/Eesrwb4FpBFKsLGehhACVnwwTI4qD3FrIlIEPlxdXg3SyrYRIcO+RRQ==",
++        "dependencies": {
++          "Microsoft.TestPlatform.ObjectModel": "18.0.1",
++          "Newtonsoft.Json": "13.0.3"
++        }
++      },
++      "MSTest.Analyzers": {
++        "type": "Transitive",
++        "resolved": "4.1.0",
++        "contentHash": "4ElL/aqomiUInr090VN4udqz46AuszXLrifHkLrgj0zb7na8eAoyUQt3BwDLTcGd1bSkmk3SfD02rZtKU+ZiqQ=="
++      },
++      "MSTest.TestAdapter": {
++        "type": "Transitive",
++        "resolved": "4.1.0",
++        "contentHash": "bRW1Hftwq0XbcVExcAbj4YAfSZDRAziL0mygDkPBvaUe2nSsWFQIatze5lHVjPFJMvSFgWnItku4pguIy5FowQ==",
++        "dependencies": {
++          "MSTest.TestFramework": "4.1.0",
++          "Microsoft.Testing.Extensions.VSTestBridge": "2.1.0",
++          "Microsoft.Testing.Platform.MSBuild": "2.1.0"
++        }
++      },
++      "MSTest.TestFramework": {
++        "type": "Transitive",
++        "resolved": "4.1.0",
++        "contentHash": "BzpvsK+CRbk6khwY62h+7HfYzIxtJXyPv9tOI9T90cy5CVy+WI1JkN4ZaNL4Dobqb6dywSwabLTIbPZKpdrr+A==",
++        "dependencies": {
++          "MSTest.Analyzers": "4.1.0"
++        }
++      },
++      "NAudio.Core": {
++        "type": "Transitive",
++        "resolved": "2.3.0",
++        "contentHash": "jMd7r6dB6tAtXhOYL58ntPqwERNm1/Rhw5MKOIYvsnXzuX+PTGsa2VMam6n0npZYSwlSidKa4GAm4bFcXFUlcg=="
++      },
++      "NAudio.Vorbis": {
++        "type": "Transitive",
++        "resolved": "1.5.0",
++        "contentHash": "llJMmUnFf0FGf4G1FKNftxt+Vc1CvBCSul0Ugbv/RahGbpKF2p+ujSEJHybPjl9b4FjbK8O2vRFIcRGcVfAooA==",
++        "dependencies": {
++          "NAudio.Core": "2.0.0",
++          "NVorbis": "0.10.4"
++        }
++      },
++      "NAudio.Wasapi": {
++        "type": "Transitive",
++        "resolved": "2.3.0",
++        "contentHash": "y5K2BxrLnvohgu5znzg5wRsai3YcuNXfrpo68i7PmCQqpK5MC/R24e5aO3OyN/XhfRr12e0QYV0OnUWEHi5SzA==",
++        "dependencies": {
++          "NAudio.Core": "2.3.0"
++        }
++      },
++      "NAudio.WinMM": {
++        "type": "Transitive",
++        "resolved": "2.3.0",
++        "contentHash": "5G1dRjsZm50T3luyuqcmI2BSvj3K4ZJaD/x776/0Epj88qOsOryDZG40+MufwIk1UFJSFWhRobBqtJYFc8Ss4g==",
++        "dependencies": {
++          "NAudio.Core": "2.3.0"
++        }
++      },
++      "NETStandard.Library": {
++        "type": "Transitive",
++        "resolved": "1.6.1",
++        "contentHash": "WcSp3+vP+yHNgS8EV5J7pZ9IRpeDuARBPN28by8zqff1wJQXm26PVU8L3/fYLBJVU7BtDyqNVWq2KlCVvSSR4A==",
++        "dependencies": {
++          "Microsoft.NETCore.Platforms": "1.1.0"
++        }
++      },
++      "Newtonsoft.Json": {
++        "type": "Transitive",
++        "resolved": "13.0.3",
++        "contentHash": "HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ=="
++      },
++      "NReco.Logging.File": {
++        "type": "Transitive",
++        "resolved": "1.2.2",
++        "contentHash": "UyUIkyDiHi2HAJlmEWqeKN9/FxTF0DPNdyatzMDMTXvUpgvqBFneJ2qDtZkXRJNG8eR6jU+KsbGeMmChgUdRUg==",
++        "dependencies": {
++          "Microsoft.Extensions.Logging": "8.0.1",
++          "Microsoft.Extensions.Logging.Configuration": "8.0.1",
++          "Microsoft.Extensions.Options.ConfigurationExtensions": "8.0.0"
++        }
++      },
++      "NVorbis": {
++        "type": "Transitive",
++        "resolved": "0.10.4",
++        "contentHash": "WYnil3DhQHzjCY0dM9I2B3r1vWip90AOuQd25KE4NrjPQBg0tBJFluRLm5YPnO5ZLDmwrfosY8jCQGQRmWI/Pg=="
++      },
++      "Penumbra.Api": {
++        "type": "Transitive",
++        "resolved": "5.15.1",
++        "contentHash": "3ikk0zIOaLm2n3nZRQpW3xaRQ2cq/TOOEApNUjYXolqbyvCrZVGXhdQulcssNUbo0AMQ81l+cf7OfqRceeRBcg=="
++      },
++      "Penumbra.String": {
++        "type": "Transitive",
++        "resolved": "1.0.8",
++        "contentHash": "VtV6urO7hxrLgTmn+4zRHpHxj3HyzoJsPOFmFRp1TuVTMS8SFB2dBD+9Dhdu2+dslyI79XWX7xKs39FXblEnYw=="
++      },
++      "SharpDX": {
++        "type": "Transitive",
++        "resolved": "4.2.0",
++        "contentHash": "3pv0LFMvfK/dv1qISJnn8xBeeT6R/FRvr0EV4KI2DGsL84Qlv6P7isWqxGyU0LCwlSVCJN3jgHJ4Bl0KI2PJww==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1"
++        }
++      },
++      "SharpDX.D3DCompiler": {
++        "type": "Transitive",
++        "resolved": "4.2.0",
++        "contentHash": "Rnsd6Ilp127xbXqhTit8WKFQUrXwWxqVGpglyWDNkIBCk0tWXNQEjrJpsl0KAObzyZaa33+EXAikLVt5fnd3GA==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1",
++          "SharpDX": "4.2.0"
++        }
++      },
++      "SharpDX.Direct2D1": {
++        "type": "Transitive",
++        "resolved": "4.2.0",
++        "contentHash": "Qs8LzDMaQf1u3KB8ArHu9pDv6itZ++QXs99a/bVAG+nKr0Hx5NG4mcN5vsfE0mVR2TkeHfeUm4PksRah6VUPtA==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1",
++          "SharpDX": "4.2.0",
++          "SharpDX.DXGI": "4.2.0"
++        }
++      },
++      "SharpDX.Direct3D11": {
++        "type": "Transitive",
++        "resolved": "4.2.0",
++        "contentHash": "oTm/iT5X/IIuJ8kNYP+DTC/MhBhqtRF5dbgPPFgLBdQv0BKzNTzXQQXd7SveBFjQg6hXEAJ2jGCAzNYvGFc9LA==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1",
++          "SharpDX": "4.2.0",
++          "SharpDX.DXGI": "4.2.0"
++        }
++      },
++      "SharpDX.DXGI": {
++        "type": "Transitive",
++        "resolved": "4.2.0",
++        "contentHash": "UjKqkgWc8U+SP+j3LBzFP6OB6Ntapjih7Xo+g1rLcsGbIb5KwewBrBChaUu7sil8rWoeVU/k0EJd3SMN4VqNZw==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1",
++          "SharpDX": "4.2.0"
++        }
++      },
++      "SharpGLTF.Core": {
++        "type": "Transitive",
++        "resolved": "1.0.6",
++        "contentHash": "m3qIvUnpvRRfQ0fp0TFfpPk+vsHkCIOf/uIVJ19fe9dwa29KCO/PeHVXKAph8nsFxFLXitTIIqCa5W8JGLMhBg=="
++      },
++      "SharpGLTF.Runtime": {
++        "type": "Transitive",
++        "resolved": "1.0.6",
++        "contentHash": "MVb0p0gzwnjHB03b0kMhf9bVUd6gSvs/jBpTkL6rMa0RtzSGARbCvZkpGbHXjxgSTncprEuzV4nAaaAucifc3Q==",
++        "dependencies": {
++          "SharpGLTF.Core": "1.0.6"
++        }
++      },
++      "SharpGLTF.Toolkit": {
++        "type": "Transitive",
++        "resolved": "1.0.6",
++        "contentHash": "wb9Ebb4uwXevL4WiLlry29RWIYlxa+NiAa0BB8iSR7VbmgSa5Ij/QaPNlKi1jjA4oL8aEygg5V76zY1SJfIS+Q==",
++        "dependencies": {
++          "SharpGLTF.Runtime": "1.0.6"
++        }
++      },
++      "SixLabors.ImageSharp": {
++        "type": "Transitive",
++        "resolved": "3.1.12",
++        "contentHash": "iAg6zifihXEFS/t7fiHhZBGAdCp3FavsF4i2ZIDp0JfeYeDVzvmlbY1CNhhIKimaIzrzSi5M/NBFcWvZT2rB/A=="
++      },
++      "Stagehand.Api": {
++        "type": "Transitive",
++        "resolved": "0.5.4",
++        "contentHash": "SCrWx7cTCfUC5G8BCZy0iKhFPydKonWn/kUMqET/Mk6xt/4hVwvXlz6g+cSJxz0d7+cCEWrBpV5ZpcdZzFYEtA=="
++      },
++      "Stagehand.Definitions": {
++        "type": "Transitive",
++        "resolved": "0.5.4",
++        "contentHash": "uweYCr/kDy/GPbgnzuIDZfA08lvfJbR6yxEmE64QIA01exdHt2Um0T1nL2K8W/swkzczDMWQjHnkGX1wQBlQDw=="
++      },
++      "System.Diagnostics.EventLog": {
++        "type": "Transitive",
++        "resolved": "9.0.10",
++        "contentHash": "Jc+az1pTMujPLDn2j5eqSfzlO7j/T1K/LB7THxdfRWOxujE4zaitUqBs7sv1t6/xmmvpU6Xx3IofCs4owYH0yQ=="
++      },
++      "System.IdentityModel.Tokens.Jwt": {
++        "type": "Transitive",
++        "resolved": "8.14.0",
++        "contentHash": "EYGgN/S+HK7S6F3GaaPLFAfK0UzMrkXFyWCvXpQWFYmZln3dqtbyIO7VuTM/iIIPMzkelg8ZLlBPvMhxj6nOAA==",
++        "dependencies": {
++          "Microsoft.IdentityModel.JsonWebTokens": "8.14.0",
++          "Microsoft.IdentityModel.Tokens": "8.14.0"
++        }
++      },
++      "TeximpNet": {
++        "type": "Transitive",
++        "resolved": "1.4.3",
++        "contentHash": "uNjTMP4Cv5jI/a/f5iqLpxaQ/aNAE7XKm9S08EEB6W3UMW82/qmcoLRkYjm+2bxBQJ3C5RU9VLu7/pRxavuYJQ==",
++        "dependencies": {
++          "NETStandard.Library": "1.6.1"
++        }
++      },
++      "MareSempiterne": {
++        "type": "Project",
++        "dependencies": {
++          "Brio.API": "[3.0.1, )",
++          "DalamudPackager": "[15.0.0, )",
++          "DnsClient": "[1.8.0, )",
++          "Downloader": "[4.0.3, )",
++          "Glamourer.Api": "[2.8.0, )",
++          "K4os.Compression.LZ4.Legacy": "[1.3.8, )",
++          "Loci.Api": "[0.1.0, )",
++          "MareSynchronos.API": "[1.0.0, )",
++          "MessagePack": "[3.1.8, )",
++          "Microsoft.AspNetCore.SignalR.Client": "[9.0.10, )",
++          "Microsoft.AspNetCore.SignalR.Protocols.MessagePack": "[10.0.11, )",
++          "Microsoft.Extensions.Hosting": "[9.0.10, )",
++          "NReco.Logging.File": "[1.2.2, )",
++          "Penumbra.Api": "[5.15.1, )",
++          "Penumbra.String": "[1.0.8, )",
++          "PlayerSync.Validation": "[1.0.0, )",
++          "SixLabors.ImageSharp": "[3.1.12, )",
++          "Stagehand.Api": "[0.5.4, )",
++          "Stagehand.Definitions": "[0.5.4, )",
++          "System.IdentityModel.Tokens.Jwt": "[8.14.0, )"
++        }
++      },
++      "maresynchronos.api": {
++        "type": "Project",
++        "dependencies": {
++          "MessagePack.Annotations": "[3.1.3, )"
++        }
++      },
++      "playersync.validation": {
++        "type": "Project",
++        "dependencies": {
++          "VFXEditor": "[1.0.0, )"
++        }
++      },
++      "vfxeditor": {
++        "type": "Project",
++        "dependencies": {
++          "BCnEncoder.Net": "[2.3.0, )",
++          "DalamudPackager": "[15.0.0, )",
++          "FlatSharp.Compiler": "[7.9.0, )",
++          "FlatSharp.Runtime": "[7.9.0, )",
++          "Google.FlatBuffers": "[25.2.10, )",
++          "HelixToolkit": "[3.1.2, )",
++          "HelixToolkit.Maths": "[3.1.2, )",
++          "HelixToolkit.SharpDX": "[3.1.2, )",
++          "NAudio.Core": "[2.3.0, )",
++          "NAudio.Vorbis": "[1.5.0, )",
++          "NAudio.Wasapi": "[2.3.0, )",
++          "NAudio.WinMM": "[2.3.0, )",
++          "Penumbra.Api": "[5.15.1, )",
++          "Penumbra.String": "[1.0.8, )",
++          "SharpDX.D3DCompiler": "[4.2.0, )",
++          "SharpGLTF.Toolkit": "[1.0.6, )",
++          "TeximpNet": "[1.4.3, )",
++          "mgholam.fastCSV": "[2.0.9, )"
++        }
++      }
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/PlayerSync.sln b/PlayerSync.sln
+index 610a653..d384f96 100644
+--- a/PlayerSync.sln
++++ b/PlayerSync.sln
+@@ -22,6 +22,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Validation", "Validation",
+ EndProject
+ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Penumbra.String", "Dalamud-VFXEditor\Penumbra.String\Penumbra.String.csproj", "{A7E791E2-1AE3-3E34-B872-7DFC714AB217}"
+ EndProject
++Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PlayerSync.SourceQualityExportTest", "PlayerSync.SourceQualityExportTest\PlayerSync.SourceQualityExportTest.csproj", "{535A211A-FEEE-47EE-B935-F04611DB084D}"
++EndProject
+ Global
+ 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+ 		Debug|Any CPU = Debug|Any CPU
+@@ -76,6 +78,14 @@ Global
+ 		{A7E791E2-1AE3-3E34-B872-7DFC714AB217}.Release|Any CPU.Build.0 = Release|x64
+ 		{A7E791E2-1AE3-3E34-B872-7DFC714AB217}.Release|x64.ActiveCfg = Release|x64
+ 		{A7E791E2-1AE3-3E34-B872-7DFC714AB217}.Release|x64.Build.0 = Release|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Debug|Any CPU.ActiveCfg = Debug|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Debug|Any CPU.Build.0 = Debug|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Debug|x64.ActiveCfg = Debug|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Debug|x64.Build.0 = Debug|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Release|Any CPU.ActiveCfg = Release|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Release|Any CPU.Build.0 = Release|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Release|x64.ActiveCfg = Release|x64
++		{535A211A-FEEE-47EE-B935-F04611DB084D}.Release|x64.Build.0 = Release|x64
+ 	EndGlobalSection
+ 	GlobalSection(SolutionProperties) = preSolution
+ 		HideSolutionNode = FALSE
+diff --git a/PlayerSync/PlayerData/Pairs/Pair.cs b/PlayerSync/PlayerData/Pairs/Pair.cs
+index a305bbb..a1dc8a7 100644
+--- a/PlayerSync/PlayerData/Pairs/Pair.cs
++++ b/PlayerSync/PlayerData/Pairs/Pair.cs
+@@ -303,6 +303,12 @@ public class Pair
+         CachedPlayer = _cachedPlayerFactory.Create(this);
+     }
+ 
++    /// <summary>
++    /// A private copy of the last received character data after this pair's permissions and the user's filters, i.e. exactly
++    /// what PlayerSync would apply. Used by the export-scoped source-quality request; the pair's own data is not changed.
++    /// </summary>
++    public CharacterData? GetSyncedCharacterDataCopy() => RemoveNotSyncedFiles(LastReceivedCharacterData?.DeepClone());
++
+     private CharacterData? RemoveNotSyncedFiles(CharacterData? data)
+     {
+         _logger.LogTrace("Removing not synced files");
+diff --git a/PlayerSync/Plugin.cs b/PlayerSync/Plugin.cs
+index 99c992d..03c2e77 100644
+--- a/PlayerSync/Plugin.cs
++++ b/PlayerSync/Plugin.cs
+@@ -128,6 +128,10 @@ public sealed class Plugin : IDalamudPlugin
+             collection.AddSingleton<MareProfileManager>();
+             collection.AddSingleton<GameObjectHandlerFactory>();
+             collection.AddSingleton<FileDownloadManagerFactory>();
++            collection.AddSingleton((s) => new Services.SourceQualityExport.SourceQualityExportService(
++                s.GetRequiredService<ILogger<Services.SourceQualityExport.SourceQualityExportService>>(), pluginInterface,
++                s.GetRequiredService<PairManager>(), s.GetRequiredService<FileCacheManager>(), s.GetRequiredService<FileTransferOrchestrator>(),
++                s.GetRequiredService<FileDownloadManagerFactory>(), s.GetRequiredService<MareConfigService>(), s.GetRequiredService<IpcManager>()));
+             collection.AddSingleton<PairHandlerFactory>();
+             collection.AddSingleton<PairFactory>();
+             collection.AddSingleton<XivDataAnalyzer>();
+@@ -300,6 +304,7 @@ public sealed class Plugin : IDalamudPlugin
+             collection.AddHostedService(p => p.GetRequiredService<DtrEntry>());
+             collection.AddHostedService(p => p.GetRequiredService<EventAggregator>());
+             collection.AddHostedService(p => p.GetRequiredService<IpcProvider>());
++            collection.AddHostedService(p => p.GetRequiredService<Services.SourceQualityExport.SourceQualityExportService>());
+             collection.AddHostedService(p => p.GetRequiredService<MarePlugin>());
+             collection.AddHostedService(p => p.GetRequiredService<GroupZoneSyncManager>());
+             collection.AddHostedService(p => p.GetRequiredService<PairInviteManager>());
+diff --git a/PlayerSync/Services/SourceQualityExport/README.md b/PlayerSync/Services/SourceQualityExport/README.md
+new file mode 100644
+index 0000000..1c49c0a
+--- /dev/null
++++ b/PlayerSync/Services/SourceQualityExport/README.md
+@@ -0,0 +1,65 @@
++# Source-quality export IPC (API version 1)
++
++Lets another plugin (the PlayerSync Mod Exporter) get the **original, source-quality files** behind one visible pair's
++current appearance for an explicitly started export, without changing how PlayerSync synchronizes.
++
++## What it does and does not do
++
++* Works only for a pair that is visible and not paused, chosen by its game object address.
++* Only files in that pair's current character data **after** PlayerSync's permission and filter rules (`Pair.GetSyncedCharacterDataCopy`,
++  the same `RemoveNotSyncedFiles` used before applying) are fetched. File swaps are never fetched. Anything else is reported `NotPermitted`
++  and never sent to the server.
++* Always uses the original hash, even when the server offers a compressed alternate (`AlwaysSourceQuality`). The user's
++  `TextureCompressionMode`, the Override UIDs list and the pair's applied appearance are not changed; normal synchronization keeps
++  following the configured policy (`FileDownloadManager.UsesCompressedAlternate`).
++* Reuses `FileDownloadManager`: the server metadata request (`GetFileInfoAsync`, which also records forbidden files in
++  `ForbiddenTransfers`), the authenticated download with its slots, speed limit and 404 reporting (`DownloadTransportFileAsync`), and the
++  transport decoding (`TransportCodec`: munge key and LZ4). There is no separate downloader.
++* Writes only into the caller's staging folder, which must exist and be outside PlayerSync's cache folder and Penumbra's mod folder.
++  Nothing is written to the cache, `FileCache.csv` is not touched, `PersistFileToStorage` is not called, and no cache file is moved,
++  rewritten or deleted. Originals already on this computer are hashed read-only and reported as `CachedOriginal` with their path.
++* Every downloaded file is decoded and its SHA-1 compared with the requested hash before it is kept.
++* Temporary files are always removed. On cancel, failure or plugin unload the job also removes the originals it staged. It never deletes
++  anything it did not create.
++* One request runs at a time, with at most 5000 files.
++
++## Functions
++
++| Name | Signature | Result |
++|---|---|---|
++| `PlayerSync.SourceQualityExport.GetApiVersion` | `Func<int>` | `1` |
++| `PlayerSync.SourceQualityExport.Start` | `Func<nint, string, List<string>, string>` (address, staging folder, hashes) | `{"requestId": "..."}` or `{"error": "..."}` |
++| `PlayerSync.SourceQualityExport.GetStatus` | `Func<string, string>` (request id) | see below |
++| `PlayerSync.SourceQualityExport.Cancel` | `Func<string, bool>` | Cancels a running request (its files are deleted) and forgets it. For a finished request it only forgets it; the staged files stay for the caller. |
++
++Call `Start` on the framework thread.
++
++`GetStatus`:
++
++```json
++{"state": "Running|Completed|Cancelled|Failed|Unknown", "error": null,
++ "files": [{"hash": "...", "gamePath": "...", "status": "...", "path": "...", "size": 0, "sha1Verified": true, "message": null}]}
++```
++
++| `status` | Meaning |
++|---|---|
++| `Pending` | Not finished yet |
++| `CachedOriginal` | Already on this computer; `path` is the existing copy (read only) |
++| `Downloaded` | Downloaded, decoded and SHA-1 verified into the staging folder; `path` is the staged file |
++| `NotPermitted` | Not in the pair's permission-filtered data; not requested |
++| `Forbidden` | The file server forbids it |
++| `NotOnServer` | The file server no longer has the original |
++| `Unavailable` | The request or download failed |
++| `HashMismatch` | The decoded bytes did not match; nothing kept |
++| `Failed` | Could not be decoded, or invalid input |
++| `Cancelled` | The request was cancelled or failed as a whole |
++
++## Code
++
++* `PlayerSync/Services/SourceQualityExport/SourceQualityExportService.cs`: IPC, pair and permission checks, staging folder checks.
++* `PlayerSync/Services/SourceQualityExport/SourceQualityExportJob.cs`: the per-request work.
++* `PlayerSync/WebAPI/Files/FileDownloadManager.cs`: `UsesCompressedAlternate`, `GetFileInfoAsync`, `DownloadTransportFileAsync` (the existing
++  download paths call the same helpers; their behaviour is unchanged).
++* `PlayerSync/WebAPI/Files/TransportCodec.cs`: the munge and LZ4 decoding, shared by both paths.
++* `PlayerSync/PlayerData/Pairs/Pair.cs`: `GetSyncedCharacterDataCopy`.
++* Tests: `PlayerSync.SourceQualityExportTest`.
+diff --git a/PlayerSync/Services/SourceQualityExport/SourceQualityExportJob.cs b/PlayerSync/Services/SourceQualityExport/SourceQualityExportJob.cs
+new file mode 100644
+index 0000000..e7147c7
+--- /dev/null
++++ b/PlayerSync/Services/SourceQualityExport/SourceQualityExportJob.cs
+@@ -0,0 +1,301 @@
++using MareSynchronos.API.Dto.Files;
++using MareSynchronos.WebAPI.Files;
++using Microsoft.Extensions.Logging;
++using System.Collections.Concurrent;
++using System.Security.Cryptography;
++using System.Text.RegularExpressions;
++
++namespace MareSynchronos.Services.SourceQualityExport;
++
++/// <summary>What the export job needs from PlayerSync. Implemented by <see cref="SourceQualityExportService"/> over FileDownloadManager.</summary>
++public interface ISourceQualityFileSource
++{
++    /// <summary>File server metadata for the hashes (FileDownloadManager.GetFileInfoAsync).</summary>
++    Task<List<DownloadFileDto>> GetFileInfoAsync(List<string> hashes, CancellationToken ct);
++
++    /// <summary>Downloads the un-munged, still LZ4-wrapped file (FileDownloadManager.DownloadTransportFileAsync).</summary>
++    Task DownloadTransportFileAsync(DownloadFileDto file, string destinationPath, CancellationToken ct);
++
++    /// <summary>Paths of local copies PlayerSync already knows for the hash, read without validating (the index is not rewritten).</summary>
++    IEnumerable<string> FindLocalCopies(string hash);
++}
++
++public enum SourceQualityFileStatus
++{
++    Pending,
++
++    /// <summary>The original was already on this computer; <see cref="SourceQualityFileResult.Path"/> points to it (read only).</summary>
++    CachedOriginal,
++
++    /// <summary>The original was downloaded, decoded and SHA-1 verified into the export staging folder.</summary>
++    Downloaded,
++
++    /// <summary>Not part of the pair's current, permission-filtered character data. Never requested from the server.</summary>
++    NotPermitted,
++
++    /// <summary>The file server marked the file as forbidden.</summary>
++    Forbidden,
++
++    /// <summary>The file server no longer has the original.</summary>
++    NotOnServer,
++
++    /// <summary>The server request or download failed.</summary>
++    Unavailable,
++
++    /// <summary>The decoded bytes did not match the hash. Nothing was kept.</summary>
++    HashMismatch,
++
++    Failed,
++    Cancelled,
++}
++
++public sealed record SourceQualityFileRequest(string Hash, string Extension, string GamePath);
++
++public sealed record SourceQualityFileResult
++{
++    public required string Hash { get; init; }
++    public string GamePath { get; init; } = string.Empty;
++    public SourceQualityFileStatus Status { get; init; }
++
++    /// <summary>For <see cref="SourceQualityFileStatus.Downloaded"/> the staged file, for CachedOriginal the existing local copy.</summary>
++    public string? Path { get; init; }
++
++    public long Size { get; init; }
++
++    /// <summary>True only when the bytes at <see cref="Path"/> were hashed and equal <see cref="Hash"/>.</summary>
++    public bool Sha1Verified { get; init; }
++
++    public string? Message { get; init; }
++}
++
++public enum SourceQualityJobState
++{
++    Running,
++    Completed,
++    Cancelled,
++    Failed,
++}
++
++/// <summary>
++/// Gets the source-quality originals of one export into a staging folder the exporter owns. It always uses the original hash,
++/// never the server's compressed alternate (the <c>AlwaysSourceQuality</c> policy), reuses the server metadata request, the
++/// authenticated download with its slots, throttling and munge handling, and the LZ4 transport decoding of the normal
++/// download, and verifies the SHA-1 of every decoded file. It never writes to the cache or its index: files go only to
++/// <see cref="StagingDirectory"/>, and only files this job created are ever deleted (temporary files always; staged originals
++/// as well when the job is cancelled or fails).
++/// </summary>
++public sealed partial class SourceQualityExportJob
++{
++    public const int MaxParallelDownloads = 3;
++
++    private readonly ISourceQualityFileSource _source;
++    private readonly IReadOnlyList<SourceQualityFileRequest> _permitted;
++    private readonly ILogger? _logger;
++    private readonly ConcurrentDictionary<string, SourceQualityFileResult> _results = new(StringComparer.OrdinalIgnoreCase);
++    private readonly ConcurrentDictionary<string, byte> _createdFiles = new(StringComparer.Ordinal);
++
++    public SourceQualityExportJob(ISourceQualityFileSource source, string stagingDirectory,
++        IReadOnlyList<SourceQualityFileRequest> permitted, IEnumerable<string> notPermitted, ILogger? logger = null)
++    {
++        _source = source;
++        StagingDirectory = System.IO.Path.GetFullPath(stagingDirectory);
++        _logger = logger;
++        _permitted = permitted.Where(r => IsHash(r.Hash) && IsExtension(r.Extension))
++            .GroupBy(r => r.Hash, StringComparer.OrdinalIgnoreCase).Select(g => g.First()).ToList();
++        foreach (var r in permitted.Where(r => !IsHash(r.Hash) || !IsExtension(r.Extension)))
++            _results[r.Hash] = new SourceQualityFileResult { Hash = r.Hash, GamePath = r.GamePath, Status = SourceQualityFileStatus.Failed, Message = "Invalid hash or extension." };
++        foreach (var r in _permitted)
++            _results[r.Hash] = new SourceQualityFileResult { Hash = r.Hash, GamePath = r.GamePath, Status = SourceQualityFileStatus.Pending };
++        foreach (var h in notPermitted)
++            _results.TryAdd(h, new SourceQualityFileResult
++            {
++                Hash = h, Status = SourceQualityFileStatus.NotPermitted,
++                Message = "Not in this pair's current character data after PlayerSync's permission filters; not requested.",
++            });
++    }
++
++    public string StagingDirectory { get; }
++
++    public SourceQualityJobState State { get; private set; } = SourceQualityJobState.Running;
++
++    public string? Error { get; private set; }
++
++    public IReadOnlyList<SourceQualityFileResult> GetResults() => _results.Values.OrderBy(r => r.Hash, StringComparer.Ordinal).ToList();
++
++    public static bool IsHash(string hash) => HashPattern().IsMatch(hash);
++
++    public static bool IsExtension(string extension) => ExtensionPattern().IsMatch(extension);
++
++    public async Task RunAsync(CancellationToken ct)
++    {
++        try
++        {
++            if (!Directory.Exists(StagingDirectory))
++                throw new DirectoryNotFoundException("The export staging folder does not exist.");
++
++            var toDownload = new List<SourceQualityFileRequest>();
++            foreach (var request in _permitted)
++            {
++                ct.ThrowIfCancellationRequested();
++                if (await TryUseLocalCopyAsync(request, ct).ConfigureAwait(false) is { } local)
++                    _results[request.Hash] = local;
++                else
++                    toDownload.Add(request);
++            }
++
++            if (toDownload.Count > 0)
++            {
++                var infos = (await _source.GetFileInfoAsync(toDownload.Select(r => r.Hash.ToUpperInvariant()).ToList(), ct).ConfigureAwait(false))
++                    .GroupBy(d => d.Hash, StringComparer.OrdinalIgnoreCase).ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
++                await Parallel.ForEachAsync(toDownload, new ParallelOptions { MaxDegreeOfParallelism = MaxParallelDownloads, CancellationToken = ct },
++                    async (request, token) => _results[request.Hash] = await GetOriginalAsync(request, infos.GetValueOrDefault(request.Hash), token).ConfigureAwait(false))
++                    .ConfigureAwait(false);
++            }
++
++            State = SourceQualityJobState.Completed;
++        }
++        catch (OperationCanceledException)
++        {
++            Abort(SourceQualityJobState.Cancelled, null);
++        }
++        catch (Exception ex)
++        {
++            _logger?.LogWarning(ex, "Source-quality export failed");
++            Abort(SourceQualityJobState.Failed, ex.Message);
++        }
++    }
++
++    private void Abort(SourceQualityJobState state, string? error)
++    {
++        DeleteCreatedFiles();
++        foreach (var (hash, result) in _results)
++        {
++            if (result.Status is SourceQualityFileStatus.Pending or SourceQualityFileStatus.Downloaded)
++                _results[hash] = result with { Status = SourceQualityFileStatus.Cancelled, Path = null, Sha1Verified = false, Size = 0 };
++        }
++
++        Error = error;
++        State = state;
++    }
++
++    private async Task<SourceQualityFileResult?> TryUseLocalCopyAsync(SourceQualityFileRequest request, CancellationToken ct)
++    {
++        foreach (var path in _source.FindLocalCopies(request.Hash))
++        {
++            try
++            {
++                if (!File.Exists(path))
++                    continue;
++                // Read-only: the copy is hashed, never moved, rewritten or re-indexed.
++                var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 81920, useAsync: true);
++                await using var _ = stream.ConfigureAwait(false);
++                var hash = Convert.ToHexString(await SHA1.HashDataAsync(stream, ct).ConfigureAwait(false));
++                if (string.Equals(hash, request.Hash, StringComparison.OrdinalIgnoreCase))
++                    return new SourceQualityFileResult
++                    {
++                        Hash = request.Hash, GamePath = request.GamePath, Status = SourceQualityFileStatus.CachedOriginal,
++                        Path = path, Size = stream.Length, Sha1Verified = true,
++                    };
++            }
++            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++            {
++                _logger?.LogDebug(ex, "Could not read local copy {path}", path);
++            }
++        }
++
++        return null;
++    }
++
++    private async Task<SourceQualityFileResult> GetOriginalAsync(SourceQualityFileRequest request, DownloadFileDto? info, CancellationToken ct)
++    {
++        SourceQualityFileResult Result(SourceQualityFileStatus status, string message)
++            => new() { Hash = request.Hash, GamePath = request.GamePath, Status = status, Message = message };
++
++        // The original's own entry is used even when CompressedAlternateFileDownload is set: AlwaysSourceQuality.
++        if (info == null)
++            return Result(SourceQualityFileStatus.Unavailable, "The file server returned no information for this file.");
++        if (info.IsForbidden)
++            return Result(SourceQualityFileStatus.Forbidden, "The file server forbids this file" + (string.IsNullOrEmpty(info.ForbiddenBy) ? "." : $" ({info.ForbiddenBy})."));
++        if (!info.FileExists || info.Size <= 0)
++            return Result(SourceQualityFileStatus.NotOnServer, "The file server no longer has the original file.");
++
++        var transportPath = StagedPath(request.Hash, "transport.tmp");
++        var decodedPath = StagedPath(request.Hash, request.Extension + ".tmp");
++        var finalPath = StagedPath(request.Hash, request.Extension);
++        try
++        {
++            _createdFiles[transportPath] = 0;
++            await _source.DownloadTransportFileAsync(info, transportPath, ct).ConfigureAwait(false);
++            if (!File.Exists(transportPath))
++                return Result(SourceQualityFileStatus.Unavailable, "The download did not complete (the server request failed).");
++
++            byte[] decoded;
++            try
++            {
++                decoded = TransportCodec.Decode(await File.ReadAllBytesAsync(transportPath, ct).ConfigureAwait(false));
++            }
++            catch (Exception ex) when (ex is not OperationCanceledException and not IOException)
++            {
++                return Result(SourceQualityFileStatus.Failed, "The downloaded data could not be decoded: " + ex.Message);
++            }
++
++            if (!string.Equals(Convert.ToHexString(SHA1.HashData(decoded)), request.Hash, StringComparison.OrdinalIgnoreCase))
++                return Result(SourceQualityFileStatus.HashMismatch, "The downloaded file does not match its hash and was discarded.");
++
++            _createdFiles[decodedPath] = 0;
++            await File.WriteAllBytesAsync(decodedPath, decoded, ct).ConfigureAwait(false);
++            _createdFiles[finalPath] = 0;
++            File.Move(decodedPath, finalPath, overwrite: true);
++            _createdFiles.TryRemove(decodedPath, out _);
++            return new SourceQualityFileResult
++            {
++                Hash = request.Hash, GamePath = request.GamePath, Status = SourceQualityFileStatus.Downloaded,
++                Path = finalPath, Size = decoded.LongLength, Sha1Verified = true,
++            };
++        }
++        catch (OperationCanceledException)
++        {
++            throw;
++        }
++        catch (Exception ex)
++        {
++            _logger?.LogWarning(ex, "Source-quality download of {hash} failed", request.Hash);
++            return Result(ex is InvalidDataException ? SourceQualityFileStatus.Unavailable : SourceQualityFileStatus.Failed, ex.Message);
++        }
++        finally
++        {
++            TryDelete(transportPath);
++            TryDelete(decodedPath);
++        }
++    }
++
++    private string StagedPath(string hash, string extension)
++        => System.IO.Path.Combine(StagingDirectory, hash.ToLowerInvariant() + "." + extension);
++
++    private void TryDelete(string path)
++    {
++        try
++        {
++            if (File.Exists(path))
++                File.Delete(path);
++            _createdFiles.TryRemove(path, out _);
++        }
++        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
++        {
++            _logger?.LogDebug(ex, "Could not delete {path}", path);
++        }
++    }
++
++    /// <summary>Deletes every file this job created (and nothing else).</summary>
++    public void DeleteCreatedFiles()
++    {
++        foreach (var path in _createdFiles.Keys.ToList())
++            TryDelete(path);
++    }
++
++    [GeneratedRegex("^[0-9A-Fa-f]{40}$", RegexOptions.None, matchTimeoutMilliseconds: 100)]
++    private static partial Regex HashPattern();
++
++    [GeneratedRegex("^[A-Za-z0-9]{1,8}$", RegexOptions.None, matchTimeoutMilliseconds: 100)]
++    private static partial Regex ExtensionPattern();
++}
+diff --git a/PlayerSync/Services/SourceQualityExport/SourceQualityExportService.cs b/PlayerSync/Services/SourceQualityExport/SourceQualityExportService.cs
+new file mode 100644
+index 0000000..a3ce718
+--- /dev/null
++++ b/PlayerSync/Services/SourceQualityExport/SourceQualityExportService.cs
+@@ -0,0 +1,263 @@
++using Dalamud.Plugin;
++using Dalamud.Plugin.Ipc;
++using MareSynchronos.API.Dto.Files;
++using MareSynchronos.FileCache;
++using MareSynchronos.Interop.Ipc;
++using MareSynchronos.MareConfiguration;
++using MareSynchronos.PlayerData.Factories;
++using MareSynchronos.PlayerData.Pairs;
++using MareSynchronos.WebAPI.Files;
++using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
++using System.Collections.Concurrent;
++using System.Text.Json;
++using System.Text.Json.Serialization;
++
++namespace MareSynchronos.Services.SourceQualityExport;
++
++/// <summary>
++/// Export-scoped source-quality downloads for another plugin (the PlayerSync Mod Exporter), exposed over IPC.
++/// For one explicitly selected, visible, unpaused pair it fetches the original files behind that pair's current,
++/// permission-filtered character data into a staging folder the caller owns. It does not change the compression setting,
++/// the Override UIDs list, the pair's applied appearance, the cache or the cache index. See Services/SourceQualityExport/README.md.
++/// </summary>
++public sealed class SourceQualityExportService : IHostedService
++{
++    public const int ApiVersion = 1;
++    public const int MaxHashesPerRequest = 5000;
++    public const int MaxKeptRequests = 4;
++
++    private const string Prefix = "PlayerSync.SourceQualityExport.";
++
++    private static readonly JsonSerializerOptions Json = new()
++    {
++        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
++        Converters = { new JsonStringEnumConverter() },
++    };
++
++    private readonly ILogger<SourceQualityExportService> _logger;
++    private readonly IDalamudPluginInterface _pi;
++    private readonly PairManager _pairManager;
++    private readonly FileCacheManager _fileCacheManager;
++    private readonly FileTransferOrchestrator _orchestrator;
++    private readonly FileDownloadManagerFactory _downloadManagerFactory;
++    private readonly MareConfigService _configService;
++    private readonly IpcManager _ipcManager;
++    private readonly ConcurrentDictionary<string, (SourceQualityExportJob Job, CancellationTokenSource Cts, Task Task)> _jobs = new(StringComparer.Ordinal);
++
++    private ICallGateProvider<int>? _apiVersion;
++    private ICallGateProvider<nint, string, List<string>, string>? _start;
++    private ICallGateProvider<string, string>? _status;
++    private ICallGateProvider<string, bool>? _cancel;
++
++    public SourceQualityExportService(ILogger<SourceQualityExportService> logger, IDalamudPluginInterface pi, PairManager pairManager,
++        FileCacheManager fileCacheManager, FileTransferOrchestrator orchestrator, FileDownloadManagerFactory downloadManagerFactory,
++        MareConfigService configService, IpcManager ipcManager)
++    {
++        _logger = logger;
++        _pi = pi;
++        _pairManager = pairManager;
++        _fileCacheManager = fileCacheManager;
++        _orchestrator = orchestrator;
++        _downloadManagerFactory = downloadManagerFactory;
++        _configService = configService;
++        _ipcManager = ipcManager;
++    }
++
++    public Task StartAsync(CancellationToken cancellationToken)
++    {
++        _apiVersion = _pi.GetIpcProvider<int>(Prefix + "GetApiVersion");
++        _apiVersion.RegisterFunc(() => ApiVersion);
++        _start = _pi.GetIpcProvider<nint, string, List<string>, string>(Prefix + "Start");
++        _start.RegisterFunc(Start);
++        _status = _pi.GetIpcProvider<string, string>(Prefix + "GetStatus");
++        _status.RegisterFunc(GetStatus);
++        _cancel = _pi.GetIpcProvider<string, bool>(Prefix + "Cancel");
++        _cancel.RegisterFunc(Cancel);
++        return Task.CompletedTask;
++    }
++
++    public async Task StopAsync(CancellationToken cancellationToken)
++    {
++        _apiVersion?.UnregisterFunc();
++        _start?.UnregisterFunc();
++        _status?.UnregisterFunc();
++        _cancel?.UnregisterFunc();
++        var running = _jobs.Values.ToList();
++        foreach (var (_, cts, _) in running)
++            cts.Cancel();
++        try
++        {
++            await Task.WhenAll(running.Select(r => r.Task)).WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
++        }
++        catch (Exception ex) when (ex is TimeoutException or OperationCanceledException)
++        {
++            _logger.LogWarning("Source-quality export jobs did not stop in time");
++        }
++
++        foreach (var (job, cts, _) in running)
++        {
++            job.DeleteCreatedFiles();
++            cts.Dispose();
++        }
++
++        _jobs.Clear();
++    }
++
++    /// <summary>Called by the IPC on the framework thread. Returns {"requestId": ...} or {"error": ...}.</summary>
++    private string Start(nint address, string stagingDirectory, List<string> hashes)
++    {
++        try
++        {
++            var (job, error) = CreateJob(address, stagingDirectory, hashes, out var source);
++            if (job == null || source == null)
++                return JsonSerializer.Serialize(new StartResult(null, error), Json);
++
++            var id = Guid.NewGuid().ToString("N");
++            var cts = new CancellationTokenSource();
++            var task = Task.Run(async () =>
++            {
++                try
++                {
++                    await job.RunAsync(cts.Token).ConfigureAwait(false);
++                }
++                finally
++                {
++                    source.Dispose();
++                }
++            });
++            _jobs[id] = (job, cts, task);
++            TrimFinishedJobs();
++            return JsonSerializer.Serialize(new StartResult(id, null), Json);
++        }
++        catch (Exception ex)
++        {
++            _logger.LogWarning(ex, "Starting a source-quality export failed");
++            return JsonSerializer.Serialize(new StartResult(null, "PlayerSync could not start the request: " + ex.Message), Json);
++        }
++    }
++
++    private (SourceQualityExportJob? Job, string? Error) CreateJob(nint address, string stagingDirectory, List<string> hashes, out FileSource? source)
++    {
++        source = null;
++        if (hashes == null || hashes.Count == 0 || hashes.Count > MaxHashesPerRequest)
++            return (null, $"Request between 1 and {MaxHashesPerRequest} files.");
++        if (_jobs.Values.Any(j => j.Job.State == SourceQualityJobState.Running))
++            return (null, "Another source-quality export is still running.");
++        if (StagingError(stagingDirectory, _configService.Current.CacheFolder, _ipcManager.Penumbra.ModDirectory) is { } stagingError)
++            return (null, stagingError);
++        if (!_orchestrator.IsInitialized)
++            return (null, "PlayerSync is not connected to a file server.");
++
++        var pair = address == nint.Zero ? null : _pairManager.GetVisiblePairs().FirstOrDefault(p => p.Address == address);
++        if (pair == null)
++            return (null, "That character is not a visible PlayerSync pair.");
++        if (pair.IsPaused)
++            return (null, "That pair is paused.");
++        if (pair.GetSyncedCharacterDataCopy() is not { } data)
++            return (null, "PlayerSync has no character data for that pair.");
++
++        var (permitted, notPermitted) = SelectPermitted(data.FileReplacements.Values.SelectMany(v => v)
++            .Select(f => (f.Hash, f.FileSwapPath, f.GamePaths)), hashes);
++        _logger.LogInformation("Source-quality export requested for {count} file(s), {rejected} not permitted", permitted.Count, notPermitted.Count);
++        source = new FileSource(_downloadManagerFactory, _fileCacheManager);
++        return (new SourceQualityExportJob(source, stagingDirectory, permitted, notPermitted, _logger), null);
++    }
++
++    /// <summary>
++    /// Keeps only requested hashes that are file replacements (not swaps) in the pair's permission-filtered data, with the
++    /// extension and first game path PlayerSync itself uses when it stores the file.
++    /// </summary>
++    public static (List<SourceQualityFileRequest> Permitted, List<string> NotPermitted) SelectPermitted(
++        IEnumerable<(string Hash, string FileSwapPath, string[] GamePaths)> synced, IEnumerable<string> requested)
++    {
++        var byHash = new Dictionary<string, SourceQualityFileRequest>(StringComparer.OrdinalIgnoreCase);
++        foreach (var (hash, swap, gamePaths) in synced)
++        {
++            if (!string.IsNullOrEmpty(swap) || string.IsNullOrEmpty(hash) || gamePaths.Length == 0 || byHash.ContainsKey(hash))
++                continue;
++            byHash[hash] = new SourceQualityFileRequest(hash, gamePaths[0].Split(".")[^1].ToLowerInvariant(), gamePaths[0]);
++        }
++
++        var permitted = new List<SourceQualityFileRequest>();
++        var notPermitted = new List<string>();
++        foreach (var hash in requested.Distinct(StringComparer.OrdinalIgnoreCase))
++        {
++            if (byHash.TryGetValue(hash, out var request))
++                permitted.Add(request);
++            else
++                notPermitted.Add(hash);
++        }
++
++        return (permitted, notPermitted);
++    }
++
++    /// <summary>The staging folder must exist and be outside PlayerSync's cache and Penumbra's mod folder.</summary>
++    public static string? StagingError(string stagingDirectory, string? cacheFolder, string? penumbraDirectory)
++    {
++        if (string.IsNullOrWhiteSpace(stagingDirectory) || !Path.IsPathFullyQualified(stagingDirectory) || !Directory.Exists(stagingDirectory))
++            return "The staging folder must be an existing absolute path.";
++        var staging = Normalize(stagingDirectory);
++        foreach (var protectedRoot in new[] { cacheFolder, penumbraDirectory })
++        {
++            if (string.IsNullOrWhiteSpace(protectedRoot))
++                continue;
++            var root = Normalize(protectedRoot);
++            if (staging.StartsWith(root, StringComparison.OrdinalIgnoreCase) || root.StartsWith(staging, StringComparison.OrdinalIgnoreCase))
++                return "The staging folder must be outside PlayerSync's cache and Penumbra's mod folder.";
++        }
++
++        return null;
++
++        static string Normalize(string path)
++            => Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/') + "/";
++    }
++
++    private string GetStatus(string requestId)
++    {
++        if (!_jobs.TryGetValue(requestId ?? string.Empty, out var entry))
++            return JsonSerializer.Serialize(new StatusResult("Unknown", "No such request.", []), Json);
++        return SerializeStatus(entry.Job);
++    }
++
++    /// <summary>The GetStatus reply: {"state", "error", "files": [{"hash", "gamePath", "status", "path", "size", "sha1Verified", "message"}]}.</summary>
++    public static string SerializeStatus(SourceQualityExportJob job)
++        => JsonSerializer.Serialize(new StatusResult(job.State.ToString(), job.Error, job.GetResults()), Json);
++
++    /// <summary>Cancels a running request (its files are deleted) and forgets it. A finished request's staged files stay for the caller.</summary>
++    private bool Cancel(string requestId)
++    {
++        if (!_jobs.TryRemove(requestId ?? string.Empty, out var entry))
++            return false;
++        entry.Cts.Cancel();
++        _ = entry.Task.ContinueWith(_ => entry.Cts.Dispose(), TaskScheduler.Default);
++        return true;
++    }
++
++    private void TrimFinishedJobs()
++    {
++        foreach (var id in _jobs.Where(j => j.Value.Job.State != SourceQualityJobState.Running).Select(j => j.Key).SkipLast(MaxKeptRequests).ToList())
++            if (_jobs.TryRemove(id, out var old))
++                old.Cts.Dispose();
++    }
++
++    private sealed record StartResult(string? RequestId, string? Error);
++
++    private sealed record StatusResult(string State, string? Error, IReadOnlyList<SourceQualityFileResult> Files);
++
++    /// <summary>A dedicated FileDownloadManager per job, so pair downloads (CurrentDownloads) are never affected.</summary>
++    private sealed class FileSource(FileDownloadManagerFactory factory, FileCacheManager cache) : ISourceQualityFileSource, IDisposable
++    {
++        private readonly FileDownloadManager _downloads = factory.Create();
++
++        public void Dispose() => _downloads.Dispose();
++
++        public Task<List<DownloadFileDto>> GetFileInfoAsync(List<string> hashes, CancellationToken ct) => _downloads.GetFileInfoAsync(hashes, ct);
++
++        public Task DownloadTransportFileAsync(DownloadFileDto file, string destinationPath, CancellationToken ct)
++            => _downloads.DownloadTransportFileAsync(file, destinationPath, ct);
++
++        public IEnumerable<string> FindLocalCopies(string hash)
++            => cache.GetAllFileCachesByHash(hash, ignoreCacheEntries: false, validate: false).Select(e => e.ResolvedFilepath).Where(p => !string.IsNullOrEmpty(p)).ToList();
++    }
++}
+diff --git a/PlayerSync/WebAPI/Files/FileDownloadManager.cs b/PlayerSync/WebAPI/Files/FileDownloadManager.cs
+index 18204c1..a64f9d9 100644
+--- a/PlayerSync/WebAPI/Files/FileDownloadManager.cs
++++ b/PlayerSync/WebAPI/Files/FileDownloadManager.cs
+@@ -1,5 +1,4 @@
+ ﻿using Dalamud.Utility;
+-using K4os.Compression.LZ4.Legacy;
+ using MareSynchronos.API.Data;
+ using MareSynchronos.API.Dto.Files;
+ using MareSynchronos.API.Routes;
+@@ -311,13 +310,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
+ 
+         Logger.LogDebug("Files with size 0 or less: {files}", string.Join(", ", downloadFileInfoFromService.Where(f => f.Size <= 0).Select(f => f.Hash)));
+ 
+-        foreach (var dto in downloadFileInfoFromService.Where(c => c.IsForbidden))
+-        {
+-            if (!_orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, dto.Hash, StringComparison.Ordinal)))
+-            {
+-                _orchestrator.ForbiddenTransfers.Add(new DownloadFileTransfer(dto));
+-            }
+-        }
++        RecordForbiddenTransfers(downloadFileInfoFromService);
+ 
+         for (int i = 0; i < downloadFileInfoFromService.Count; i++)
+         {
+@@ -331,7 +324,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
+                 _compressedAlternateManager.SetCompressedAlternate(file.CompressedAlternateFileDownload.Hash, compressedAlternateHash: null, neverWillHaveAlternate: true);
+ 
+                 // If the compressed alternate usage requests it, download the alternate instead.
+-                if (compressedAlternateUsage == CompressedAlternateUsage.CompressedNewDownloads || compressedAlternateUsage == CompressedAlternateUsage.AlwaysCompressed)
++                if (UsesCompressedAlternate(compressedAlternateUsage))
+                 {
+                     usingAlternate = true;
+                     Logger.LogDebug("Preparing to download compressed file {compressed} instead of original file {original}.", file.CompressedAlternateFileDownload.Hash, file.Hash);
+@@ -435,20 +428,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
+                         // Download the compressed file directly
+                         statusCallback.Invoke(DownloadStatus.Downloading);
+ 
+-                        DownloadDataCallback? munge = null;
+-                        if (directDownload.MungeKey != null)
+-                        {
+-                            long mungeOffset = 0;
+-                            byte[] mungeKeyBytes = Encoding.ASCII.GetBytes(directDownload.MungeKey);
+-                            munge = span =>
+-                            {
+-                                for (int i = 0; i < span.Length; i++)
+-                                {
+-                                    span[i] = (byte)(span[i] ^ mungeKeyBytes[mungeOffset]);
+-                                    mungeOffset = (mungeOffset + 1) % mungeKeyBytes.Length;
+-                                }
+-                            };
+-                        }
++                        DownloadDataCallback? munge = TransportCodec.CreateUnmunger(directDownload.MungeKey) is { } unmunger ? unmunger.Apply : null;
+ #if DEBUG
+                         Logger.LogDebug("Beginning direct download of {hash} from {url} with key {key}", directDownload.Hash, directDownload.DirectDownloadUrl!, directDownload.MungeKey ?? "<none>");
+ #else
+@@ -484,7 +464,7 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
+                         var finalFilename = _fileDbManager.GetCacheFilePath(directDownload.Hash, fileExtension);
+                         Logger.LogDebug("Decompressing direct download {hash} from {compressedFile} to {finalFile}", directDownload.Hash, tempFilename, finalFilename);
+                         byte[] compressedBytes = await File.ReadAllBytesAsync(tempFilename).ConfigureAwait(false);
+-                        var decompressedBytes = LZ4Wrapper.Unwrap(compressedBytes);
++                        var decompressedBytes = TransportCodec.Decode(compressedBytes);
+                         await _fileCompactor.WriteAllBytesAsync(finalFilename, decompressedBytes, CancellationToken.None).ConfigureAwait(false);
+                         PersistFileToStorage(directDownload.Hash, finalFilename);
+                         Logger.LogDebug("Finished direct download of {hash}.", directDownload.Hash);
+@@ -511,6 +491,57 @@ public partial class FileDownloadManager : DisposableMediatorSubscriberBase
+         ClearDownload();
+     }
+ 
++    /// <summary>Whether a download under this policy replaces a file by its server-compressed alternate when one exists.</summary>
++    public static bool UsesCompressedAlternate(CompressedAlternateUsage usage)
++        => usage is CompressedAlternateUsage.CompressedNewDownloads or CompressedAlternateUsage.AlwaysCompressed;
++
++    private void RecordForbiddenTransfers(IEnumerable<DownloadFileDto> files)
++    {
++        foreach (var dto in files.Where(c => c.IsForbidden))
++        {
++            if (!_orchestrator.ForbiddenTransfers.Exists(f => string.Equals(f.Hash, dto.Hash, StringComparison.Ordinal)))
++            {
++                _orchestrator.ForbiddenTransfers.Add(new DownloadFileTransfer(dto));
++            }
++        }
++    }
++
++    /// <summary>
++    /// Export-scoped: the file server's metadata (existence, size, direct download URL, forbidden flag) for these hashes,
++    /// through the same authenticated request as <see cref="InitiateDownloadList"/>. Forbidden files are recorded in
++    /// <see cref="FileTransferOrchestrator.ForbiddenTransfers"/> as usual. Nothing is downloaded and the cache is not touched.
++    /// </summary>
++    public async Task<List<DownloadFileDto>> GetFileInfoAsync(List<string> fileHashes, CancellationToken ct)
++    {
++        if (fileHashes.Count == 0) return [];
++        var files = await FilesGetSizes(fileHashes, 0, ct).ConfigureAwait(false);
++        RecordForbiddenTransfers(files);
++        return files;
++    }
++
++    /// <summary>
++    /// Export-scoped: downloads one file to <paramref name="destinationPath"/> with the shared download slots, speed limit and
++    /// un-munging, leaving it LZ4-wrapped (<see cref="TransportCodec.Decode"/>). Unlike the normal download, the file is never
++    /// written to the cache, never registered in the cache index and never passed to <see cref="PersistFileToStorage"/>.
++    /// If the server request fails the destination file does not exist afterwards.
++    /// </summary>
++    public async Task DownloadTransportFileAsync(DownloadFileDto file, string destinationPath, CancellationToken ct)
++    {
++        if (string.IsNullOrEmpty(file.DirectDownloadUrl))
++            throw new InvalidDataException($"The file server offered no download URL for {file.Hash}.");
++
++        await _orchestrator.WaitForDownloadSlotAsync(ct).ConfigureAwait(false);
++        try
++        {
++            DownloadDataCallback? munge = TransportCodec.CreateUnmunger(file.MungeKey) is { } unmunger ? unmunger.Apply : null;
++            await DownloadFileThrottled(new Uri(file.DirectDownloadUrl), destinationPath, file.Hash, new Progress<long>(), munge, ct, withToken: false).ConfigureAwait(false);
++        }
++        finally
++        {
++            _orchestrator.ReleaseDownloadSlot();
++        }
++    }
++
+     private async Task<List<DownloadFileDto>> FilesGetSizes(List<string> hashes, int storeId, CancellationToken ct)
+     {
+         if (!_orchestrator.IsInitialized) throw new InvalidOperationException("FileTransferManager is not initialized");
+diff --git a/PlayerSync/WebAPI/Files/TransportCodec.cs b/PlayerSync/WebAPI/Files/TransportCodec.cs
+new file mode 100644
+index 0000000..e863ebe
+--- /dev/null
++++ b/PlayerSync/WebAPI/Files/TransportCodec.cs
+@@ -0,0 +1,36 @@
++using K4os.Compression.LZ4.Legacy;
++using System.Text;
++
++namespace MareSynchronos.WebAPI.Files;
++
++/// <summary>
++/// The transport encoding of files served by the PlayerSync file server: the bytes are XOR "munged" with the file's
++/// <c>MungeKey</c> (undone while streaming) and LZ4-wrapped (<see cref="LZ4Wrapper"/>, undone after the download).
++/// Shared by the normal cache download and the export-scoped source-quality download.
++/// </summary>
++public static class TransportCodec
++{
++    /// <summary>Undoes the munge in place, continuing across buffers. Returns null when the file has no munge key.</summary>
++    public static Unmunger? CreateUnmunger(string? mungeKey)
++        => string.IsNullOrEmpty(mungeKey) ? null : new Unmunger(Encoding.ASCII.GetBytes(mungeKey));
++
++    /// <summary>Unwraps the LZ4 container of a fully downloaded (and un-munged) file.</summary>
++    public static byte[] Decode(byte[] wrapped) => LZ4Wrapper.Unwrap(wrapped);
++
++    public sealed class Unmunger
++    {
++        private readonly byte[] _key;
++        private long _offset;
++
++        internal Unmunger(byte[] key) => _key = key;
++
++        public void Apply(Span<byte> span)
++        {
++            for (int i = 0; i < span.Length; i++)
++            {
++                span[i] = (byte)(span[i] ^ _key[_offset]);
++                _offset = (_offset + 1) % _key.Length;
++            }
++        }
++    }
++}

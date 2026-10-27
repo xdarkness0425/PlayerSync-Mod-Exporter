@@ -8,6 +8,7 @@ using PlayerSyncModExporter.Core.Metadata;
 using PlayerSyncModExporter.Core.Model;
 using PlayerSyncModExporter.Core.Packaging;
 using PlayerSyncModExporter.Core.Safety;
+using PlayerSyncModExporter.Core.SourceQuality;
 using PlayerSyncModExporter.Interop;
 
 namespace PlayerSyncModExporter.Services;
@@ -17,6 +18,7 @@ public enum SessionPhase
     Idle,
     Analyzing,
     Ready,
+    DownloadingOriginals,
     Exporting,
 }
 
@@ -27,6 +29,9 @@ public enum SessionPhase
 public sealed class ExportSession : IDisposable
 {
     private const int MaxLogLines = 300;
+
+    /// <summary>A source-quality download that has not finished by then is cancelled.</summary>
+    public static readonly TimeSpan SourceQualityTimeout = TimeSpan.FromMinutes(15);
 
     private readonly PlayerSyncAdapter _playerSync;
     private readonly PenumbraAdapter _penumbra;
@@ -40,6 +45,10 @@ public sealed class ExportSession : IDisposable
     private CancellationTokenSource? _cts;
     private object? _capturedDataReference;
     private DateTime _lastPairRefresh = DateTime.MinValue;
+    private OriginalsStaging? _originals;
+    private SourceQualityDownloadResult? _originalsResult;
+    private string? _originalsRequestId;
+    private DateTime _originalsDeadline;
 
     public ExportSession(PlayerSyncAdapter playerSync, PenumbraAdapter penumbra, IObjectTable objects, IPluginLog log, Configuration config)
     {
@@ -63,6 +72,9 @@ public sealed class ExportSession : IDisposable
     public ExportConsent Consent { get; set; } = new();
     public string PackageName { get; set; } = string.Empty;
 
+    /// <summary>Originals finished and requested so far while <see cref="SessionPhase.DownloadingOriginals"/>.</summary>
+    public (int Finished, int Requested)? SourceQualityProgress { get; private set; }
+
     public IReadOnlyList<string> LogLines
     {
         get
@@ -72,7 +84,11 @@ public sealed class ExportSession : IDisposable
         }
     }
 
-    public void Dispose() => _cts?.Cancel();
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        DiscardOriginals(); // plugin shutdown: cancel PlayerSync's request and delete this export's staged originals
+    }
 
     /// <summary>Refreshes the pair list at most once a second. Framework thread only.</summary>
     public void Tick(bool force = false)
@@ -91,6 +107,9 @@ public sealed class ExportSession : IDisposable
             _log.Warning(e, "Reading PlayerSync pairs failed");
         }
 
+        if (Phase == SessionPhase.DownloadingOriginals)
+            PollOriginals();
+
         if (Selected != null)
         {
             var current = Pairs.FirstOrDefault(p => ReferenceEquals(p.PairHandle, Selected.PairHandle));
@@ -104,11 +123,12 @@ public sealed class ExportSession : IDisposable
 
     public void Select(SyncedCharacter? character)
     {
-        if (Phase is SessionPhase.Analyzing or SessionPhase.Exporting)
+        if (Phase is SessionPhase.Analyzing or SessionPhase.Exporting or SessionPhase.DownloadingOriginals)
             return;
         if (ReferenceEquals(character?.PairHandle, Selected?.PairHandle))
             return;
         Selected = character;
+        DiscardOriginals(); // staged originals belong to one character
         ClearCapture();
     }
 
@@ -127,12 +147,12 @@ public sealed class ExportSession : IDisposable
     /// <summary>Captures the selected character and starts analysis. Framework thread only.</summary>
     public void CaptureAndAnalyze()
     {
-        if (Selected == null || Phase is SessionPhase.Analyzing or SessionPhase.Exporting)
+        if (Selected == null || Phase is SessionPhase.Analyzing or SessionPhase.Exporting or SessionPhase.DownloadingOriginals)
             return;
 
         ClearCapture();
         var label = BuildLabel(Selected);
-        var captured = _playerSync.Capture(Selected, label, out var error);
+        var captured = _playerSync.Capture(Selected, label, out var error, _originalsResult);
         if (captured == null)
         {
             Fail(error ?? "Capture failed.");
@@ -144,9 +164,12 @@ public sealed class ExportSession : IDisposable
         var objectIndex = FindObjectIndex(Selected.Address);
         var live = objectIndex is { } idx ? _penumbra.GetResolvedFilesFor(idx) : null;
         var locators = _playerSync.CreateLocators(_penumbra.GetModDirectory());
+        if (_originals != null && _originalsResult != null)
+            locators.Insert(0, new StagedOriginalsLocator(_originals.Path, _originalsResult));
         Log($"Captured '{label}': {captured.Files.Count} file entries, {captured.FileSwaps.Count} swaps, {captured.NotSyncedFiles.Count} not synced. Sources: {string.Join(", ", locators.Select(l => l.Name))}.");
         foreach (var w in captured.CaptureWarnings)
             Log("Warning: " + w);
+        Log("Texture source: " + captured.TextureSource.Describe());
 
         var cts = ResetCts();
         Phase = SessionPhase.Analyzing;
@@ -191,7 +214,117 @@ public sealed class ExportSession : IDisposable
         });
     }
 
-    public void Cancel() => _cts?.Cancel();
+    public void Cancel()
+    {
+        if (Phase == SessionPhase.DownloadingOriginals)
+        {
+            DiscardOriginals();
+            Phase = Analysis != null ? SessionPhase.Ready : SessionPhase.Idle;
+            Log("Download of originals cancelled; nothing was kept.");
+        }
+
+        _cts?.Cancel();
+    }
+
+    /// <summary>Why "Download originals" cannot be used right now, or null.</summary>
+    public string? OriginalsUnavailableReason()
+    {
+        if (Analysis == null || Selected == null || Phase != SessionPhase.Ready)
+            return "Capture the character first.";
+        if (!SourceQualityRequestPlan.From(Analysis).IsNeeded)
+            return "No compressed textures are in use.";
+        if (Selected.IsPaused)
+            return "The pair is paused.";
+        if (!_playerSync.SourceQualityExportAvailable())
+            return "The installed PlayerSync does not provide the source-quality export interface (see docs/SOURCE_QUALITY.md).";
+        if (ValidateDestination() is { } destError)
+            return destError + " Originals are staged inside it.";
+        return null;
+    }
+
+    /// <summary>
+    /// Asks PlayerSync to download, at source quality, the originals of the compressed textures in this capture into a staging
+    /// folder inside the export folder. PlayerSync's settings, the pair's applied appearance and PlayerSync's cache are not
+    /// changed. When it finishes the character is captured and analysed again with the staged originals. Framework thread only.
+    /// </summary>
+    public void StartOriginalsDownload()
+    {
+        if (OriginalsUnavailableReason() is { } reason)
+        {
+            Fail(reason);
+            return;
+        }
+
+        var plan = SourceQualityRequestPlan.From(Analysis!);
+        DiscardOriginals();
+        try
+        {
+            OriginalsStaging.CleanupAbandoned(_config.ExportDirectory);
+            _originals = OriginalsStaging.Create(_config.ExportDirectory);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            Fail("Could not create the staging folder for originals: " + e.Message);
+            return;
+        }
+
+        var requestId = _playerSync.StartSourceQualityExport(Selected!, _originals.Path, plan.Hashes, out var error);
+        if (requestId == null)
+        {
+            DiscardOriginals();
+            Fail("PlayerSync refused the request: " + error);
+            return;
+        }
+
+        _originalsRequestId = requestId;
+        _originalsDeadline = DateTime.UtcNow + SourceQualityTimeout;
+        SourceQualityProgress = (0, plan.Hashes.Count);
+        LastError = null;
+        Phase = SessionPhase.DownloadingOriginals;
+        Log($"Asked PlayerSync for the source-quality originals of {plan.Hashes.Count} texture(s) for this export.");
+    }
+
+    private void PollOriginals()
+    {
+        if (_originalsRequestId == null)
+            return;
+        var status = _playerSync.GetSourceQualityExportStatus(_originalsRequestId);
+        SourceQualityProgress = (status.Finished, Math.Max(status.Requested, SourceQualityProgress?.Requested ?? 0));
+        if (!status.IsFinished && DateTime.UtcNow < _originalsDeadline)
+            return;
+
+        if (!status.IsFinished)
+            status = status with { State = "Failed", Error = $"PlayerSync did not finish within {SourceQualityTimeout.TotalMinutes} minutes" };
+        Log(status.Describe());
+        foreach (var f in status.Files.Where(f => !f.IsAvailable))
+            Log($"  {f.Hash[..Math.Min(8, f.Hash.Length)]}: {f.Status}{(f.Message is { Length: > 0 } m ? " - " + m : string.Empty)}");
+
+        Phase = Analysis != null ? SessionPhase.Ready : SessionPhase.Idle;
+        SourceQualityProgress = null;
+        if (status.State != "Completed")
+        {
+            DiscardOriginals();
+            Fail(status.Describe());
+            return;
+        }
+
+        _playerSync.CancelSourceQualityExport(_originalsRequestId); // forget the finished request; the staged files stay
+        _originalsRequestId = null;
+        _originalsResult = status;
+        CaptureAndAnalyze();
+    }
+
+    /// <summary>Cancels a running request and deletes this export's staged originals (only that folder).</summary>
+    private void DiscardOriginals()
+    {
+        if (_originalsRequestId != null)
+            _playerSync.CancelSourceQualityExport(_originalsRequestId);
+        _originalsRequestId = null;
+        _originalsResult = null;
+        SourceQualityProgress = null;
+        _originals?.Dispose();
+        _originals = null;
+    }
 
     public PackagePlan? PreviewPlan()
         => Analysis == null ? null : PackagePlan.Create(Analysis, _config.IncludeNonPlayerObjects);

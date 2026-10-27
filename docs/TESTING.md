@@ -17,7 +17,9 @@ dotnet test  PlayerSyncModExporter.slnx -c Release
 | Step | Result |
 |---|---|
 | `dotnet build -c Release` (Core, plugin, tests) | Succeeded, 0 warnings, 0 errors. DalamudPackager produced `bin/Release/PlayerSyncModExporter/latest.zip` and the manifest JSON (API level 15). |
-| `dotnet test -c Release` | **110 passed, 0 failed, 0 skipped** (about 5 s). 65 original tests plus 45 for metadata and texture recovery. |
+| `dotnet test -c Release` | **132 passed, 0 failed, 0 skipped** (about 5 s). 65 original tests, 45 for metadata and texture recovery, 22 for the source-quality integration. |
+| PlayerSync patch: `dotnet build PlayerSync/PlayerSync.csproj -c Release` | Succeeded, 0 errors (see [integrations/playersync](../integrations/playersync/README.md) for the local build notes). |
+| PlayerSync patch: `dotnet test PlayerSync.SourceQualityExportTest` | **18 passed, 0 failed, 0 skipped.** |
 
 ## What the automated tests cover
 
@@ -46,6 +48,13 @@ directory and `FileCache.csv`). The tests are in `tests/PlayerSyncModExporter.Te
 | Textures: header validation (valid, truncated, invalid, size limits) | `TexFileValidatorTests.*` (5 valid formats, truncated header, truncated data, huge claimed surface, 6 invalid headers, random bytes) |
 | Textures: every confirmed representation | `TextureRecoveryTests.ValidCompressedAlternate_IsPreservedByteForByte_AndVerifiedAgainstTheAlternateHash` (T4), `OriginalMissingFromPlayerSyncIndex_IsRecoveredFromInstalledModByGamePath` (T4 recovery), `CacheFilesAreAlreadyDecoded_AndAreNeverDecompressedAgain` (T2), `OriginalWithUnrecognizedHeader_IsStillExportedUnchanged` (T1) |
 | Textures: corrupt, unsupported, mixed outcomes | `InvalidOrTruncatedCompressedAlternate_IsNotExported` (2 cases), `InstalledModWithDifferentFileAtThatPath_DoesNotReplaceTheAlternate`, `MixedTextureOutcomes_AreEachReported_AndThePackageIsPartialWithReasons` |
+| Source quality: mode detection | `TextureSourceSettingTests.*` (PlayerSync default when unset, all three modes, Override UIDs wins, unknown values reported as unknown) |
+| Source quality: PlayerSync's reply | `SourceQualityDownloadResultTests.*` (the documented JSON, unknown statuses, malformed replies, progress) |
+| Source quality: what is requested | `SourceQualityDownloadTests.Plan_RequestsOnlyCompressedAndInvalidSubstitutes_NeverFilteredOrForbiddenFiles`, `NothingCompressed_NoRequestIsNeeded` |
+| Source quality: original used, verified, cache untouched | `DownloadedOriginal_IsExportedVerifiedAgainstItsOwnHash_AndTheCacheIsUntouched`, `OriginalAlreadyInTheCache_WinsWithoutADownload_EvenWithAStaleRedirect` |
+| Source quality: off, fallback, wrong bytes, outside staging, failures, mixed | `SourceQualityOff_NoDownload_TheSubstituteIsFlagged_AndTheManifestSaysWhy`, `StagedFileWithWrongBytes_IsRejected_AndTheSubstituteIsUsedAndFlagged`, `OnlyDownloadedFilesInsideTheStagingFolder_AreOffered`, `OriginalsPlayerSyncCouldNotProvide_StayCompressed_WithTheReason_AndTheRestIsMixed` |
+| Source quality: staging cleanup | `OriginalsStagingTests.Dispose_DeletesOnlyItsOwnFolder_AndCleanupLeavesForeignFoldersAlone` |
+| PlayerSync patch (`PlayerSync.SourceQualityExportTest`) | Normal sync still follows the policy; original hash used although an alternate exists; only permission-filtered files, never swaps; not-permitted files never sent to the server; forbidden; not on server; cached original used read-only; corrupt local copy left alone; munge and LZ4 decoding; SHA-1 mismatch; undecodable data, failed request, HTTP error, missing URL; cancellation deletes only the job's files; missing staging folder; invalid input; nothing written outside the staging folder; staging folder must be outside cache and Penumbra; status JSON shape |
 
 ### Additional manual check (not in the repository)
 
@@ -71,6 +80,9 @@ None of the following has been run. They are not claimed to work until someone t
 9. Indexing a real Penumbra mod directory (hundreds of mods, FileVersion 4 files with conditions, IMC and combining groups) and how long it takes.
 10. Importing a `.pmp` with recovered `group_NNN_*.json` files in the installed Penumbra and checking that the enabled options reproduce the look.
 11. Real PlayerSync compressed alternates: confirming they pass the texture header check (only synthetic BC7 fixtures were used).
+12. The patched PlayerSync: the IPC registering, the server accepting the original-hash requests, real munge keys and LZ4 payloads, the
+    staged files matching, PlayerSync's cache folder and `FileCache.csv` unchanged afterwards, and Cancel, closing the window and unloading
+    either plugin mid-download leaving no files behind.
 
 ### Suggested in-game test plan
 
@@ -79,6 +91,8 @@ None of the following has been run. They are not claimed to work until someone t
 3. Export both formats to an empty folder, confirm `manifest.json` lists Partial/Complete with sensible reasons.
 4. Import the `.pmp` into a test collection assigned to a GPose actor; apply `appearance/glamourer.b64.txt` with Glamourer.
 5. In GPose, apply the `.mcdf` to an actor through PlayerSync and compare.
-6. Set PlayerSync texture compression to "Always use source quality", let the pair re-sync, re-capture: compressed alternates should disappear.
+6. With the patched PlayerSync and compressed textures listed, press **Download originals for this export**. When it finishes the textures
+   should show "Downloaded original", `manifest.json` should show `textureSource.download`, PlayerSync's settings should be unchanged and its
+   cache folder should contain no new files.
 7. Pause the pair in PlayerSync: capture must be refused. Disable sounds for the pair: `.scd` files must show as "Not synced".
 8. Start a large export and press Cancel: no folder or staging folder must remain.

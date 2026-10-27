@@ -81,5 +81,5 @@ original is exported unchanged even if its header is unusual, because those are 
 * Metadata depends on the user having the same mods installed; for files from mods that are not installed nothing can be recovered.
 * If the user renamed or edited their installed copy, the recovered name is the edited one ("names as recorded there").
 * Two identical installed copies that explain the character equally well leave the file unattributed.
-* Compressed alternates stay compressed unless the user switches PlayerSync to "Always use source quality" and the pair re-syncs.
+* Compressed alternates stay compressed unless the originals are downloaded for the export through the patched PlayerSync, or PlayerSync applies the pair in source-quality mode (see [SOURCE_QUALITY.md](SOURCE_QUALITY.md)).
 * Meta manipulations stay in the package default option; PlayerSync sends them as one combined string with no per-mod split.

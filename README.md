@@ -43,8 +43,20 @@ of their creators.
 2. Add `https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/repo.json`, tick it and press Save.
 3. Open `/xlplugins`, search for "PlayerSync Mod Exporter" and install it.
 
-The repository serves the build in `dist/latest.zip`. To publish a new version, raise `<Version>` in the plugin's `.csproj`, build in
-Release, copy `bin/Release/PlayerSyncModExporter/latest.zip` to `dist/` and update `AssemblyVersion` and `LastUpdate` in `repo.json`.
+The repository URL points to the published `main` distribution branch. When changes are merged to the development branch
+(`claude/project-thread-k0zd3n`), GitHub Actions builds the full Dalamud plugin on Windows, runs the core tests,
+checks the packaged manifest and DLL, then **publishes the matching ZIP and an incremented version in `repo.json`** on
+`main`. If the CI checks fail, the public plugin download remains unchanged.
+
+Updates are delivered through **Dalamud's normal plugin updater**, not by writing directly to your computer. Check
+`/xlplugins` for an available update after Dalamud refreshes the custom repository. A plugin loaded through
+**Dev Plugin Locations** is a local development copy and does not receive custom-repository updates; install through the
+custom repository instead. Each release receives a version of the form `0.4.0.<GitHub workflow number>`.
+
+To verify a publication, inspect the workflow's **Publish auto-update manifest and ZIP to main** job and compare
+`AssemblyVersion` in the public
+[repo.json](https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/repo.json)
+with the version shown by Dalamud. GitHub's raw-file cache may take a little time to refresh.
 
 ## Install (development build)
 

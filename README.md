@@ -30,6 +30,15 @@ of their creators.
 * Penumbra (for `.pmp` import and for converting meta manipulations).
 * Glamourer and Customize+ are optional (used only to apply the exported appearance strings).
 
+## Install (custom repository)
+
+1. In game, open `/xlsettings` → Experimental → Custom Plugin Repositories.
+2. Add `https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/repo.json`, tick it and press Save.
+3. Open `/xlplugins`, search for "PlayerSync Mod Exporter" and install it.
+
+The repository serves the build in `dist/latest.zip`. To publish a new version, raise `<Version>` in the plugin's `.csproj`, build in
+Release, copy `bin/Release/PlayerSyncModExporter/latest.zip` to `dist/` and update `AssemblyVersion` and `LastUpdate` in `repo.json`.
+
 ## Install (development build)
 
 1. Build: `dotnet build PlayerSyncModExporter.slnx -c Release` (set `DALAMUD_HOME` to your Dalamud folder if it is not in the default

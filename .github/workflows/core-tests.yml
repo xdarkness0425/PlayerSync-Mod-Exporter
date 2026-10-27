@@ -1,15 +1,16 @@
-name: .NET 10 catalog and core tests
+name: .NET 10 build, tests and Dalamud publishing
 
 on:
   push:
     branches:
-      - feature/fingerprint-evidence-detail
+      - claude/project-thread-k0zd3n
   pull_request:
     paths:
-      - 'src/PlayerSyncModExporter.Core/**'
-      - 'tests/PlayerSyncModExporter.Tests/**'
+      - 'src/**'
+      - 'tests/**'
       - '.github/workflows/core-tests.yml'
-      - 'src/PlayerSyncModExporter/**'
+      - 'global.json'
+      - 'Directory.Build.props'
   workflow_dispatch:
 
 permissions:
@@ -35,7 +36,9 @@ jobs:
   plugin-build:
     name: Build full Dalamud plugin (Windows)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.release-version.outputs.version }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -43,7 +46,7 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Install current Dalamud runtime for compilation
+      - name: Install Dalamud runtime for compilation
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -52,6 +55,109 @@ jobs:
           Invoke-WebRequest -Uri 'https://goatcorp.github.io/dalamud-distrib/latest.zip' -OutFile 'dalamud.zip'
           Expand-Archive -Path 'dalamud.zip' -DestinationPath $dalamudDir -Force
           Remove-Item 'dalamud.zip'
+      - name: Calculate monotonically increasing published version
+        id: release-version
+        shell: pwsh
+        run: |
+          $version = "0.4.0.$env:GITHUB_RUN_NUMBER"
+          "PLUGIN_VERSION=$version" >> $env:GITHUB_ENV
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "Building plugin version $version"
       - name: Build entire plugin solution (Release)
         shell: pwsh
-        run: dotnet build PlayerSyncModExporter.slnx --configuration Release
+        run: dotnet build PlayerSyncModExporter.slnx --configuration Release "-p:Version=$env:PLUGIN_VERSION" "-p:AssemblyVersion=$env:PLUGIN_VERSION"
+      - name: Validate produced Dalamud package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseFolder = "src/PlayerSyncModExporter/bin/Release"
+          $packages = @(Get-ChildItem -Path $releaseFolder -Filter 'latest.zip' -File -Recurse)
+          if ($packages.Count -ne 1) { throw "Expected exactly one packaged latest.zip, found $($packages.Count)." }
+          $extractDir = Join-Path $env:RUNNER_TEMP "inspect-plugin-zip"
+          Expand-Archive -Path $packages[0].FullName -DestinationPath $extractDir -Force
+          $dlls = @(Get-ChildItem -Path $extractDir -Filter 'PlayerSyncModExporter.dll' -File -Recurse)
+          $manifests = @(Get-ChildItem -Path $extractDir -Filter 'PlayerSyncModExporter.json' -File -Recurse)
+          if ($dlls.Count -ne 1 -or $manifests.Count -ne 1) { throw 'Package is missing its plugin DLL or manifest.' }
+          $manifest = Get-Content -Path $manifests[0].FullName -Raw | ConvertFrom-Json
+          if ($manifest.InternalName -ne 'PlayerSyncModExporter') { throw "Unexpected InternalName: $($manifest.InternalName)" }
+          if ($manifest.AssemblyVersion -ne $env:PLUGIN_VERSION) {
+            throw "Package version $($manifest.AssemblyVersion) does not match expected version $env:PLUGIN_VERSION."
+          }
+          New-Item -ItemType Directory -Force -Path 'release-package' | Out-Null
+          Copy-Item -Path $packages[0].FullName -Destination 'release-package/latest.zip'
+      - name: Upload verified ZIP for publishing
+        if: github.ref == 'refs/heads/claude/project-thread-k0zd3n' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-dalamud-plugin
+          path: release-package/latest.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish auto-update manifest and ZIP to main
+    needs:
+      - core-tests
+      - plugin-build
+    if: github.ref == 'refs/heads/claude/project-thread-k0zd3n' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out public plugin distribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+      - name: Download tested Dalamud package
+        uses: actions/download-artifact@v4
+        with:
+          name: verified-dalamud-plugin
+          path: release-package
+      - name: Stage ZIP and update public repository manifest
+        env:
+          PLUGIN_VERSION: ${{ needs.plugin-build.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import time
+
+          version = os.environ["PLUGIN_VERSION"]
+          if not (pathlib.Path("release-package/latest.zip").is_file()):
+              raise SystemExit("Validated plugin package was not downloaded")
+          repo_path = pathlib.Path("repo.json")
+          entries = json.loads(repo_path.read_text(encoding="utf-8"))
+          if len(entries) != 1 or entries[0].get("InternalName") != "PlayerSyncModExporter":
+              raise SystemExit("Unexpected Dalamud custom repository format")
+          plugin = entries[0]
+          old_version = plugin.get("AssemblyVersion", "0.0.0.0")
+          def parts(v):
+              values = tuple(map(int, v.split(".")))
+              if len(values) != 4:
+                  raise ValueError("Expected four numeric version components")
+              return values
+          if parts(version) <= parts(old_version):
+              raise SystemExit(f"Refusing to publish non-increasing version: {version} <= {old_version}")
+          plugin["AssemblyVersion"] = version
+          plugin["LastUpdate"] = max(int(time.time()), int(plugin.get("LastUpdate", 0)) + 1)
+          plugin["DownloadLinkInstall"] = "https://raw.githubusercontent.com/xdarkness0425/PlayerSync-Mod-Exporter/main/dist/latest.zip"
+          plugin["DownloadLinkUpdate"] = plugin["DownloadLinkInstall"]
+          plugin["DownloadLinkTesting"] = plugin["DownloadLinkInstall"]
+          pathlib.Path("dist").mkdir(exist_ok=True)
+          shutil.copyfile("release-package/latest.zip", "dist/latest.zip")
+          repo_path.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+          print(f"Prepared PlayerSyncModExporter v{version} for custom repository publication")
+          PY
+      - name: Publish atomically in one Git commit
+        env:
+          PLUGIN_VERSION: ${{ needs.plugin-build.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add repo.json dist/latest.zip
+          git commit -m "Publish PlayerSync Mod Exporter v$PLUGIN_VERSION"
+          git push origin HEAD:main

@@ -22,6 +22,22 @@ public enum AssetStatus
 
     /// <summary>The captured entry itself is malformed (bad hash or no valid game paths).</summary>
     InvalidMetadata,
+
+    /// <summary>A local copy matched its hash, but is a substitute whose content is not a valid texture. It is not exported.</summary>
+    InvalidContent,
+}
+
+/// <summary>Which bytes an available entry exports, relative to the hash PlayerSync referenced.</summary>
+public enum ContentRepresentation
+{
+    /// <summary>The referenced file itself, found where PlayerSync stores or indexes it. SHA-1 equals <see cref="AssetEntry.Hash"/>.</summary>
+    Original,
+
+    /// <summary>The referenced file itself, found in an installed mod by game path because PlayerSync's index had no copy. SHA-1 equals the hash.</summary>
+    OriginalFromInstalledMod,
+
+    /// <summary>PlayerSync's server-generated compressed substitute (a different file). SHA-1 equals the alternate hash, not the referenced hash.</summary>
+    CompressedAlternate,
 }
 
 public enum AssetProvenance
@@ -71,6 +87,11 @@ public sealed class AssetEntry
 
     /// <summary>False when the local bytes are a PlayerSync server-generated compressed alternate rather than the original file.</summary>
     public bool IsOriginalContent { get; set; } = true;
+
+    public ContentRepresentation Representation { get; set; } = ContentRepresentation.Original;
+
+    /// <summary>Header check for .tex files (informational for originals, required for compressed alternates).</summary>
+    public Textures.TexCheck? Texture { get; set; }
 
     public SharingStatus Sharing { get; set; } = SharingStatus.Unknown;
 

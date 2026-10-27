@@ -28,6 +28,7 @@ public sealed class ExportManifest
     public ManifestSummary Summary { get; set; } = new();
     public List<ManifestFile> Files { get; set; } = [];
     public List<ManifestFileSwap> FileSwaps { get; set; } = [];
+    public ManifestMetadataRecovery Metadata { get; set; } = new();
     public ManifestMeta Meta { get; set; } = new();
     public ManifestAppearance Appearance { get; set; } = new();
     public List<string> Warnings { get; set; } = [];
@@ -101,6 +102,8 @@ public sealed class ManifestSummary
     public int InvalidMetadata { get; set; }
     public int ExcludedByUser { get; set; }
     public int CompressedAlternatesIncluded { get; set; }
+    public int InvalidContent { get; set; }
+    public int OriginalsFromInstalledMods { get; set; }
     public int FileSwaps { get; set; }
 }
 
@@ -116,9 +119,99 @@ public sealed class ManifestFile
     public bool Included { get; set; }
     public string Provenance { get; set; } = string.Empty;
     public bool IsOriginalContent { get; set; }
+
+    /// <summary>Original, OriginalFromInstalledMod or CompressedAlternate (see docs/EXPORT_FORMAT.md).</summary>
+    public string? Representation { get; set; }
+
+    /// <summary>Which hash the exported bytes were verified against: "hash" (the referenced file) or "compressedAlternateHash".</summary>
+    public string? VerifiedAgainst { get; set; }
+    public ManifestTexture? Texture { get; set; }
     public string SharingStatus { get; set; } = string.Empty;
     public string? ArchivePath { get; set; }
     public string? Note { get; set; }
+
+    /// <summary>Per game path: which installed mod and option this file was matched to, if any.</summary>
+    public List<ManifestAttribution> Attribution { get; set; } = [];
+}
+
+/// <summary>A value plus where it came from: Recovered (authoritative), Inferred (derived, labeled) or Unavailable.</summary>
+public sealed class ClassifiedField
+{
+    public string? Value { get; set; }
+    public string Classification { get; set; } = string.Empty;
+    public string Source { get; set; } = string.Empty;
+}
+
+public sealed class ManifestAttribution
+{
+    public string GamePath { get; set; } = string.Empty;
+    public string Classification { get; set; } = string.Empty;
+    public string? ModName { get; set; }
+    public string? ModFolder { get; set; }
+    public string? Group { get; set; }
+    public List<string> Options { get; set; } = [];
+
+    /// <summary>"default" (mod's default container), "group" (reproduced option group) or "unattributed".</summary>
+    public string Placement { get; set; } = "unattributed";
+    public List<string> CandidateMods { get; set; } = [];
+    public ClassifiedField InferredCategory { get; set; } = new();
+    public string? Note { get; set; }
+}
+
+public sealed class ManifestMetadataRecovery
+{
+    public string Method { get; set; } =
+        "PlayerSync transfers only content hashes and game paths, never mod names or options. A file is attributed to an installed mod only when "
+        + "that mod (in your local Penumbra mod directory, read-only) redirects the same game path to a file with the identical SHA-1.";
+    public bool LibraryAvailable { get; set; }
+    public int ModsIndexed { get; set; }
+    public int LibraryProblems { get; set; }
+    public int AttributedPaths { get; set; }
+    public int AmbiguousPaths { get; set; }
+    public int UnattributedPaths { get; set; }
+    public List<ManifestSourceMod> SourceMods { get; set; } = [];
+
+    /// <summary>Information that cannot be recovered from the accessible data, and why.</summary>
+    public List<string> Unavailable { get; set; } = [];
+}
+
+public sealed class ManifestSourceMod
+{
+    public ClassifiedField Name { get; set; } = new();
+    public ClassifiedField Author { get; set; } = new();
+    public ClassifiedField Description { get; set; } = new();
+    public ClassifiedField Version { get; set; } = new();
+    public ClassifiedField Website { get; set; } = new();
+    public string Folder { get; set; } = string.Empty;
+    public int FileVersion { get; set; }
+    public int MatchedPaths { get; set; }
+    public List<ManifestSourceGroup> Groups { get; set; } = [];
+}
+
+public sealed class ManifestSourceGroup
+{
+    public ClassifiedField Name { get; set; } = new();
+    public ClassifiedField Type { get; set; } = new();
+
+    /// <summary>The mod author's default selection (option names), from the installed copy.</summary>
+    public ClassifiedField AuthorDefault { get; set; } = new();
+
+    /// <summary>The options this character appears to use, from which files matched.</summary>
+    public ClassifiedField InferredSelection { get; set; } = new();
+    public List<string> ReproducedOptions { get; set; } = [];
+    public int TotalOptions { get; set; }
+    public string? PackageGroup { get; set; }
+}
+
+public sealed class ManifestTexture
+{
+    public bool HeaderValid { get; set; }
+    public string? Format { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public int MipLevels { get; set; }
+    public int ArraySize { get; set; }
+    public string? Problem { get; set; }
 }
 
 public sealed class ManifestFileSwap

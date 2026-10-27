@@ -228,7 +228,7 @@ public class ExportTests : IDisposable
     public async Task CompressedAlternates_AreExportedButFlagged()
     {
         var original = TestFixture.Sha1(TestFixture.RandomBytes(4000, 8));
-        var alt = _fx.AddCacheFile(TestFixture.RandomBytes(1000, 9), "tex");
+        var alt = _fx.AddCacheFile(TestFixture.Tex(64, 64, seed: 9), "tex");
         var analysis = await _fx.Analyzer().AnalyzeAsync(TestFixture.Character([new(Player, original, ["chara/a/b.tex"])], b => b.Redirects[original] = alt));
 
         var result = await new ExportPackager().ExportAsync(_fx.Request(analysis));

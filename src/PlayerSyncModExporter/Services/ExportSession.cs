@@ -4,6 +4,7 @@ using PlayerSyncModExporter.Core.Analysis;
 using PlayerSyncModExporter.Core.Hashing;
 using PlayerSyncModExporter.Core.IO;
 using PlayerSyncModExporter.Core.Meta;
+using PlayerSyncModExporter.Core.Metadata;
 using PlayerSyncModExporter.Core.Model;
 using PlayerSyncModExporter.Core.Packaging;
 using PlayerSyncModExporter.Core.Safety;
@@ -150,11 +151,16 @@ public sealed class ExportSession : IDisposable
         var cts = ResetCts();
         Phase = SessionPhase.Analyzing;
         var progress = new Progress<AnalysisProgress>(p => AnalysisProgress = p);
-        var options = new AssetAnalyzerOptions { PreselectNonPlayerObjects = _config.IncludeNonPlayerObjects };
+        var modDirectory = _penumbra.GetModDirectory();
         Task.Run(async () =>
         {
             try
             {
+                // Read-only: installed mods are the only source of original mod names and option groups.
+                var library = await ModLibraryIndex.BuildAsync(modDirectory, token: cts.Token).ConfigureAwait(false);
+                Log($"Indexed {library.Mods.Count} installed Penumbra mods for name and option recovery"
+                    + (library.Problems.Count > 0 ? $" ({library.Problems.Count} could not be read)." : "."));
+                var options = new AssetAnalyzerOptions { PreselectNonPlayerObjects = _config.IncludeNonPlayerObjects, ModLibrary = library };
                 var result = await new AssetAnalyzer(locators, _hashCache).AnalyzeAsync(captured, options, progress, cts.Token).ConfigureAwait(false);
                 if (live != null)
                 {
@@ -168,6 +174,9 @@ public sealed class ExportSession : IDisposable
                 Log($"Analysis: {result.Count(AssetStatus.Available)} available, {result.Count(AssetStatus.Missing)} missing, "
                     + $"{result.Count(AssetStatus.HashMismatch)} corrupt, {result.Count(AssetStatus.NotSynced)} not synced, "
                     + $"{result.Count(AssetStatus.ForbiddenByServer)} forbidden.");
+                if (result.Metadata.SourceMods.Count > 0)
+                    Log($"Matched files to {result.Metadata.SourceMods.Count} installed mod(s): "
+                        + string.Join(", ", result.Metadata.SourceMods.Select(m => m.Mod.DisplayName)) + ".");
             }
             catch (OperationCanceledException)
             {
